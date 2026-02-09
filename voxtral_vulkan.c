@@ -571,10 +571,57 @@ static void submit_and_continue(VkCommandBuffer cmd) {
     g_submit_idx = (g_submit_idx + 1) % SUBMIT_RING_SIZE;
 }
 
+/* ========================================================================
+ * Optional timing (very low overhead, host-side)
+ * Enable with VOX_VK_TIMING=1 in the environment.
+ * ======================================================================== */
+
+static int g_vk_timing = 0;
+static double g_vk_submit_ms = 0.0;
+static uint64_t g_vk_submit_count = 0;
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static void vk_timing_init_once(void) {
+    static int inited = 0;
+    if (inited) return;
+    inited = 1;
+    const char *e = getenv("VOX_VK_TIMING");
+    g_vk_timing = (e && e[0] && strcmp(e, "0") != 0);
+}
+
+static void vk_timing_note_submit(double ms) {
+    if (!g_vk_timing) return;
+    g_vk_submit_ms += ms;
+    g_vk_submit_count++;
+}
+
+static void vk_timing_report_and_reset(void) {
+    if (!g_vk_timing) return;
+    if (g_vk_submit_count == 0) return;
+    fprintf(stderr, "Vulkan timing: %llu submits, submit+wait %.1f ms (avg %.3f ms)\n",
+            (unsigned long long)g_vk_submit_count,
+            g_vk_submit_ms,
+            g_vk_submit_ms / (double)g_vk_submit_count);
+    g_vk_submit_ms = 0.0;
+    g_vk_submit_count = 0;
+}
+
 /* For places that still want a strict sync, keep a helper */
 static void submit_and_wait(VkCommandBuffer cmd) {
+    double t0 = 0.0;
+    if (g_vk_timing) t0 = now_ms();
+
     submit_and_continue(cmd);
-    vkWaitForFences(g_device, 1, &g_submit_fence[(g_submit_idx + SUBMIT_RING_SIZE - 1) % SUBMIT_RING_SIZE], VK_TRUE, UINT64_MAX);
+
+    VkFence last = g_submit_fence[(g_submit_idx + SUBMIT_RING_SIZE - 1) % SUBMIT_RING_SIZE];
+    vkWaitForFences(g_device, 1, &last, VK_TRUE, UINT64_MAX);
+
+    if (g_vk_timing) vk_timing_note_submit(now_ms() - t0);
 }
 
 static VkCommandBuffer begin_cmd(void) {
@@ -610,6 +657,8 @@ static void cmd_barrier(VkCommandBuffer cmd) {
 
 int vox_vulkan_init(void) {
     if (g_initialized) return 1;
+
+    vk_timing_init_once();
 
     /* Create instance */
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -792,6 +841,8 @@ void vox_vulkan_shutdown(void) {
     if (!g_initialized) return;
 
     vkDeviceWaitIdle(g_device);
+
+    vk_timing_report_and_reset();
 
     submit_ring_shutdown();
 
