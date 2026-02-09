@@ -493,28 +493,93 @@ static void bind_buffer(VkDescriptorSet ds, int binding, VkBuffer buf,
  * Command Buffer Helpers
  * ======================================================================== */
 
-static VkCommandBuffer begin_cmd(void) {
-    VkCommandBuffer cmd;
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = g_cmd_pool;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-    vkAllocateCommandBuffers(g_device, &ai, &cmd);
+/* ------------------------------------------------------------------------
+ * Command submission: fence-based ring (avoid vkQueueWaitIdle per submit)
+ * ------------------------------------------------------------------------ */
+
+static VkCommandBuffer begin_cmd_ring(void);
+
+
+#define SUBMIT_RING_SIZE 4
+static VkCommandBuffer g_submit_cmd[SUBMIT_RING_SIZE];
+static VkFence g_submit_fence[SUBMIT_RING_SIZE];
+static int g_submit_idx = 0;
+
+static int submit_ring_init(void) {
+    for (int i = 0; i < SUBMIT_RING_SIZE; i++) {
+        g_submit_cmd[i] = VK_NULL_HANDLE;
+        g_submit_fence[i] = VK_NULL_HANDLE;
+
+        /* Allocate command buffer */
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = g_cmd_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(g_device, &ai, &g_submit_cmd[i]) != VK_SUCCESS)
+            return 0;
+
+        /* Fence starts signaled so first use doesn't wait */
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (vkCreateFence(g_device, &fci, NULL, &g_submit_fence[i]) != VK_SUCCESS)
+            return 0;
+    }
+    g_submit_idx = 0;
+    return 1;
+}
+
+static void submit_ring_shutdown(void) {
+    for (int i = 0; i < SUBMIT_RING_SIZE; i++) {
+        if (g_submit_fence[i]) vkDestroyFence(g_device, g_submit_fence[i], NULL);
+        g_submit_fence[i] = VK_NULL_HANDLE;
+        if (g_submit_cmd[i]) vkFreeCommandBuffers(g_device, g_cmd_pool, 1, &g_submit_cmd[i]);
+        g_submit_cmd[i] = VK_NULL_HANDLE;
+    }
+}
+
+static VkCommandBuffer begin_cmd_ring(void) {
+    int i = g_submit_idx;
+
+    /* Wait for previous work using this slot to finish */
+    if (vkWaitForFences(g_device, 1, &g_submit_fence[i], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    vkResetFences(g_device, 1, &g_submit_fence[i]);
+
+    vkResetCommandBuffer(g_submit_cmd[i], 0);
 
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-    return cmd;
+    if (vkBeginCommandBuffer(g_submit_cmd[i], &bi) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+
+    return g_submit_cmd[i];
 }
 
-static void submit_and_wait(VkCommandBuffer cmd) {
+static void submit_and_continue(VkCommandBuffer cmd) {
+    if (cmd == VK_NULL_HANDLE) return;
+
     vkEndCommandBuffer(cmd);
+
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(g_queue);
-    vkFreeCommandBuffers(g_device, g_cmd_pool, 1, &cmd);
+
+    int i = g_submit_idx;
+    vkQueueSubmit(g_queue, 1, &si, g_submit_fence[i]);
+
+    /* Advance ring */
+    g_submit_idx = (g_submit_idx + 1) % SUBMIT_RING_SIZE;
+}
+
+/* For places that still want a strict sync, keep a helper */
+static void submit_and_wait(VkCommandBuffer cmd) {
+    submit_and_continue(cmd);
+    vkWaitForFences(g_device, 1, &g_submit_fence[(g_submit_idx + SUBMIT_RING_SIZE - 1) % SUBMIT_RING_SIZE], VK_TRUE, UINT64_MAX);
+}
+
+static VkCommandBuffer begin_cmd(void) {
+    /* Use fence-based ring to avoid vkQueueWaitIdle per submit */
+    return begin_cmd_ring();
 }
 
 /* Encode a compute dispatch into an open command buffer */
@@ -671,6 +736,16 @@ int vox_vulkan_init(void) {
         return 0;
     }
 
+    /* Init submit ring (fences + persistent command buffers) */
+    if (!submit_ring_init()) {
+        fprintf(stderr, "Vulkan: submit ring init failed\n");
+        vkDestroyDescriptorPool(g_device, g_desc_pool, NULL);
+        vkDestroyCommandPool(g_device, g_cmd_pool, NULL);
+        vkDestroyDevice(g_device, NULL);
+        vkDestroyInstance(g_instance, NULL);
+        return 0;
+    }
+
     /* Create all compute pipelines */
     struct { pipeline_id_t id; const uint32_t *spirv; size_t size; } shaders[] = {
         {PIPE_MATMUL_BF16,         spv_matmul_bf16,         sizeof(spv_matmul_bf16)},
@@ -717,6 +792,8 @@ void vox_vulkan_shutdown(void) {
     if (!g_initialized) return;
 
     vkDeviceWaitIdle(g_device);
+
+    submit_ring_shutdown();
 
     /* Free buffer cache */
     for (int i = 0; i < g_buf_cache_count; i++) {
