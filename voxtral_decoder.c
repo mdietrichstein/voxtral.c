@@ -46,7 +46,74 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
+static int g_dec_ffn_int8 = 0;
+
+static void dec_int8_init_once(void) {
+    static int inited = 0;
+    if (inited) return;
+    inited = 1;
+    const char *e = getenv("VOX_DEC_FFN_INT8");
+    g_dec_ffn_int8 = (e && e[0] && strcmp(e, "0") != 0);
+}
+
+static void quantize_bf16_row_to_i8(const uint16_t *w_bf16, int in_dim,
+                                   int8_t *w_i8, float *scale_out) {
+    /* symmetric per-row quant: scale = max_abs/127 */
+    float max_abs = 0.0f;
+    for (int k = 0; k < in_dim; k++) {
+        uint32_t bits = ((uint32_t)w_bf16[k]) << 16;
+        float v;
+        memcpy(&v, &bits, sizeof(float));
+        float a = fabsf(v);
+        if (a > max_abs) max_abs = a;
+    }
+    float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+    float inv = (scale != 0.0f) ? (1.0f / scale) : 0.0f;
+
+    for (int k = 0; k < in_dim; k++) {
+        uint32_t bits = ((uint32_t)w_bf16[k]) << 16;
+        float v;
+        memcpy(&v, &bits, sizeof(float));
+        int q = (int)lrintf(v * inv);
+        if (q > 127) q = 127;
+        if (q < -127) q = -127;
+        w_i8[k] = (int8_t)q;
+    }
+    *scale_out = scale;
+}
+
+static int decoder_quantize_ffn_int8_layer(vox_dec_layer_t *l) {
+    int dim = VOX_DEC_DIM;
+    int hidden = VOX_DEC_HIDDEN;
+
+    l->w1_i8 = (int8_t *)malloc((size_t)hidden * dim);
+    l->w1_scale = (float *)malloc((size_t)hidden * sizeof(float));
+    l->w3_i8 = (int8_t *)malloc((size_t)hidden * dim);
+    l->w3_scale = (float *)malloc((size_t)hidden * sizeof(float));
+    l->w2_i8 = (int8_t *)malloc((size_t)dim * hidden);
+    l->w2_scale = (float *)malloc((size_t)dim * sizeof(float));
+
+    if (!l->w1_i8 || !l->w1_scale || !l->w3_i8 || !l->w3_scale || !l->w2_i8 || !l->w2_scale)
+        return -1;
+
+    for (int o = 0; o < hidden; o++) {
+        const uint16_t *row = l->w1_weight_bf16 + (size_t)o * dim;
+        quantize_bf16_row_to_i8(row, dim, l->w1_i8 + (size_t)o * dim, &l->w1_scale[o]);
+    }
+    for (int o = 0; o < hidden; o++) {
+        const uint16_t *row = l->w3_weight_bf16 + (size_t)o * dim;
+        quantize_bf16_row_to_i8(row, dim, l->w3_i8 + (size_t)o * dim, &l->w3_scale[o]);
+    }
+    for (int o = 0; o < dim; o++) {
+        const uint16_t *row = l->w2_weight_bf16 + (size_t)o * hidden;
+        quantize_bf16_row_to_i8(row, hidden, l->w2_i8 + (size_t)o * hidden, &l->w2_scale[o]);
+    }
+
+    return 0;
+}
+
 int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
+    dec_int8_init_once();
     char name[512];
 
     /* Token embeddings (large, bf16 mmap direct) */
@@ -94,6 +161,13 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
             !l->wv_weight_bf16 || !l->wo_weight_bf16) {
             fprintf(stderr, "decoder: failed to load layer %d\n", i);
             return -1;
+        }
+
+        if (g_dec_ffn_int8) {
+            if (decoder_quantize_ffn_int8_layer(l) != 0) {
+                fprintf(stderr, "decoder: FFN int8 quantization failed (layer %d)\n", i);
+                return -1;
+            }
         }
 
         if (vox_verbose >= 2)
@@ -473,11 +547,19 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
             for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
         }
 
-        vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
-        vox_silu(gate_buf, hidden);
-        vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
-        vox_mul_inplace(gate_buf, up_buf, hidden);
-        vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
+        if (g_dec_ffn_int8 && l->w1_i8 && l->w3_i8 && l->w2_i8) {
+            vox_linear_nobias_i8(gate_buf, x_norm, l->w1_i8, l->w1_scale, dim, hidden);
+            vox_silu(gate_buf, hidden);
+            vox_linear_nobias_i8(up_buf, x_norm, l->w3_i8, l->w3_scale, dim, hidden);
+            vox_mul_inplace(gate_buf, up_buf, hidden);
+            vox_linear_nobias_i8(ffn_out, gate_buf, l->w2_i8, l->w2_scale, hidden, dim);
+        } else {
+            vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
+            vox_silu(gate_buf, hidden);
+            vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
+            vox_mul_inplace(gate_buf, up_buf, hidden);
+            vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
+        }
         vox_add_inplace(x, ffn_out, dim);
     }
 

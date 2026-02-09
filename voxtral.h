@@ -122,6 +122,14 @@ typedef struct {
     float *w3_weight;        /* [9216, 3072] up - f32 (NULL if bf16) */
     uint16_t *w3_weight_bf16;/* [9216, 3072] - bf16 mmap direct */
     float *ffn_norm;         /* [3072] */
+
+    /* Optional FFN int8 weight-only quantization (allocated at load time if enabled) */
+    int8_t *w1_i8;           /* [9216, 3072] */
+    float *w1_scale;         /* [9216] per output row */
+    int8_t *w3_i8;           /* [9216, 3072] */
+    float *w3_scale;         /* [9216] */
+    int8_t *w2_i8;           /* [3072, 9216] */
+    float *w2_scale;         /* [3072] */
 } vox_dec_layer_t;
 
 typedef struct {

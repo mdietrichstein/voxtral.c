@@ -68,6 +68,13 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                        int M, int K, int N);
 
+/* Weight-only int8 linear for M=1 (decoder fast path)
+ * Wq: [out_dim, in_dim] int8, scale: [out_dim] f32
+ */
+void vox_linear_nobias_i8(float *y, const float *x,
+                          const int8_t *W_i8, const float *scale,
+                          int in_dim, int out_dim);
+
 /* ========================================================================
  * 1D Convolution (for audio encoder conv stem)
  * ======================================================================== */

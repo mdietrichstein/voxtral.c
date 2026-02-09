@@ -325,6 +325,21 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
     bf16_matvec_range(y, x, W_bf16, bias, in_dim, 0, out_dim);
 }
 
+void vox_linear_nobias_i8(float *y, const float *x,
+                          const int8_t *W_i8, const float *scale,
+                          int in_dim, int out_dim) {
+    /* Single-row linear: y[out_dim] = (W_i8[out_dim,in_dim] @ x[in_dim]) * scale[out_dim]
+     * Weight-only int8 (per-output scale), f32 accumulate.
+     */
+
+    for (int o = 0; o < out_dim; o++) {
+        const int8_t *w_row = W_i8 + (size_t)o * in_dim;
+        float sum = 0.0f;
+        for (int k = 0; k < in_dim; k++) sum += (float)w_row[k] * x[k];
+        y[o] = sum * scale[o];
+    }
+}
+
 void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                             int seq_len, int in_dim, int out_dim) {
 #ifdef USE_METAL
