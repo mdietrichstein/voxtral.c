@@ -1766,10 +1766,7 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
     /* Batch multiple layers per command buffer submit to reduce overhead */
 #define ENC_LAYERS_PER_SUBMIT 4
-    VkDescriptorSet batch_ds[24 * ENC_LAYERS_PER_SUBMIT];
-    int n_batch_ds = 0;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-#define TRACK_DS(ds) do { batch_ds[n_batch_ds++] = (ds); } while(0)
 
     for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
         if (layer % ENC_LAYERS_PER_SUBMIT == 0) {
@@ -1785,7 +1782,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsN, 2, pXnorm->buffer, 0, (size_t)M * dim * sizeof(float));
         struct { int h; float e; } pushN = {dim, eps};
         cmd_dispatch(cmd, PIPE_RMS_NORM, dsN, &pushN, M);
-        TRACK_DS(dsN);
 
         /* Debug: check norm output after layer 0 */
         cmd_barrier(cmd);
@@ -1801,7 +1797,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         int pushQKV[3] = {M, qkv_merged, dim};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsQKV, pushQKV,
             ((M + 63) / 64) * ((qkv_merged + 63) / 64));
-        TRACK_DS(dsQKV);
 
         cmd_barrier(cmd);
 
@@ -1812,7 +1807,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         int totalQ = M * qkv_dim;
         struct { int ss, cc, co, tt; } pushDeQ = {qkv_merged, qkv_dim, 0, totalQ};
         cmd_dispatch(cmd, PIPE_DEINTERLEAVE, dsDeQ, &pushDeQ, (totalQ + 255) / 256);
-        TRACK_DS(dsDeQ);
 
         VkDescriptorSet dsDeK = alloc_descriptor_set(PIPE_DEINTERLEAVE);
         bind_buffer(dsDeK, 0, pQKV->buffer, 0, (size_t)M * qkv_merged * sizeof(float));
@@ -1820,14 +1814,12 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         int totalK = M * kv_dim;
         struct { int ss, cc, co, tt; } pushDeK = {qkv_merged, kv_dim, qkv_dim, totalK};
         cmd_dispatch(cmd, PIPE_DEINTERLEAVE, dsDeK, &pushDeK, (totalK + 255) / 256);
-        TRACK_DS(dsDeK);
 
         VkDescriptorSet dsDeV = alloc_descriptor_set(PIPE_DEINTERLEAVE);
         bind_buffer(dsDeV, 0, pQKV->buffer, 0, (size_t)M * qkv_merged * sizeof(float));
         bind_buffer(dsDeV, 1, pV->buffer, 0, (size_t)M * kv_dim * sizeof(float));
         struct { int ss, cc, co, tt; } pushDeV = {qkv_merged, kv_dim, qkv_dim + kv_dim, totalK};
         cmd_dispatch(cmd, PIPE_DEINTERLEAVE, dsDeV, &pushDeV, (totalK + 255) / 256);
-        TRACK_DS(dsDeV);
         cmd_barrier(cmd);
 
 
@@ -1838,7 +1830,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsBQ, 1, bQB->buffer, 0, qkv_dim * sizeof(float));
         struct { int d, t; } pushBQ = {qkv_dim, totalQ};
         cmd_dispatch(cmd, PIPE_BIAS_ADD, dsBQ, &pushBQ, (totalQ + 255) / 256);
-        TRACK_DS(dsBQ);
 
         buf_cache_entry_t *bVB = get_cached_buffer(l->wv_bias, kv_dim * sizeof(float));
         VkDescriptorSet dsBV = alloc_descriptor_set(PIPE_BIAS_ADD);
@@ -1846,7 +1837,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsBV, 1, bVB->buffer, 0, kv_dim * sizeof(float));
         struct { int d, t; } pushBV = {kv_dim, totalK};
         cmd_dispatch(cmd, PIPE_BIAS_ADD, dsBV, &pushBV, (totalK + 255) / 256);
-        TRACK_DS(dsBV);
         cmd_barrier(cmd);
 
         /* Batched RoPE on Q and K */
@@ -1856,7 +1846,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         struct { int nh, hd, sl; } pushRQ = {n_heads, head_dim, M};
         int nRQ = M * n_heads * (head_dim / 2);
         cmd_dispatch(cmd, PIPE_BATCHED_ROPE_APPLY, dsRQ, &pushRQ, (nRQ + 255) / 256);
-        TRACK_DS(dsRQ);
 
         VkDescriptorSet dsRK = alloc_descriptor_set(PIPE_BATCHED_ROPE_APPLY);
         bind_buffer(dsRK, 0, pK->buffer, 0, (size_t)M * kv_dim * sizeof(float));
@@ -1864,7 +1853,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         struct { int nh, hd, sl; } pushRK = {n_kv_heads, head_dim, M};
         int nRK = M * n_kv_heads * (head_dim / 2);
         cmd_dispatch(cmd, PIPE_BATCHED_ROPE_APPLY, dsRK, &pushRK, (nRK + 255) / 256);
-        TRACK_DS(dsRK);
         cmd_barrier(cmd);
 
         /* KV cache write */
@@ -1876,14 +1864,12 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsCK, 1, pK->buffer, 0, (size_t)kv_total_copy * sizeof(float));
         struct { int off, tot; } pushCK = {kv_offset, kv_total_copy};
         cmd_dispatch(cmd, PIPE_KV_CACHE_COPY, dsCK, &pushCK, (kv_total_copy + 255) / 256);
-        TRACK_DS(dsCK);
 
         VkDescriptorSet dsCV = alloc_descriptor_set(PIPE_KV_CACHE_COPY);
         bind_buffer(dsCV, 0, gpu_kv_v, 0, VK_WHOLE_SIZE);
         bind_buffer(dsCV, 1, pV->buffer, 0, (size_t)kv_total_copy * sizeof(float));
         struct { int off, tot; } pushCV = {kv_offset, kv_total_copy};
         cmd_dispatch(cmd, PIPE_KV_CACHE_COPY, dsCV, &pushCV, (kv_total_copy + 255) / 256);
-        TRACK_DS(dsCV);
         cmd_barrier(cmd);
 
         /* Encoder attention */
@@ -1904,7 +1890,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         int bq = 8;
         int n_q_blocks = (M + bq - 1) / bq;
         cmd_dispatch(cmd, PIPE_ENCODER_ATTENTION, dsA, &pushA, n_heads * n_q_blocks);
-        TRACK_DS(dsA);
         cmd_barrier(cmd);
 
 
@@ -1918,7 +1903,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         int pushWo[3] = {M, dim, qkv_dim};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsWo, pushWo,
             ((M + 63) / 64) * ((dim + 63) / 64));
-        TRACK_DS(dsWo);
         cmd_barrier(cmd);
 
         /* wo_bias + residual + FFN norm */
@@ -1929,7 +1913,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsBias, 1, bWoB->buffer, 0, dim * sizeof(float));
         struct { int d, t; } pushBias = {dim, n_dim};
         cmd_dispatch(cmd, PIPE_BIAS_ADD, dsBias, &pushBias, (n_dim + 255) / 256);
-        TRACK_DS(dsBias);
         cmd_barrier(cmd);
 
         VkDescriptorSet dsAddR = alloc_descriptor_set(PIPE_ADD_INPLACE);
@@ -1937,7 +1920,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsAddR, 1, pProj->buffer, 0, (size_t)n_dim * sizeof(float));
         cmd_dispatch(cmd, PIPE_ADD_INPLACE, dsAddR, &n_dim, (n_dim + 255) / 256);
 
-        TRACK_DS(dsAddR);
         cmd_barrier(cmd);
 
         buf_cache_entry_t *bFN = get_cached_buffer(l->ffn_norm, dim * sizeof(float));
@@ -1947,7 +1929,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsFN, 2, pXnorm->buffer, 0, (size_t)n_dim * sizeof(float));
         struct { int h; float e; } pushFN = {dim, eps};
         cmd_dispatch(cmd, PIPE_RMS_NORM, dsFN, &pushFN, M);
-        TRACK_DS(dsFN);
         cmd_barrier(cmd);
 
 
@@ -1962,7 +1943,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         int pushFF[3] = {M, ffn_merged, dim};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsFF, pushFF,
             ((M + 63) / 64) * ((ffn_merged + 63) / 64));
-        TRACK_DS(dsFF);
         cmd_barrier(cmd);
 
 
@@ -1971,7 +1951,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsSM, 0, pGate->buffer, 0, (size_t)M * ffn_merged * sizeof(float));
         struct { int h, t; } pushSM = {hidden, n_gate};
         cmd_dispatch(cmd, PIPE_SILU_MUL_MERGED, dsSM, &pushSM, (n_gate + 255) / 256);
-        TRACK_DS(dsSM);
         cmd_barrier(cmd);
 
 
@@ -1983,7 +1962,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         int totalG = M * hidden;
         struct { int ss, cc, co, tt; } pushDeG = {ffn_merged, hidden, 0, totalG};
         cmd_dispatch(cmd, PIPE_DEINTERLEAVE, dsDeG, &pushDeG, (totalG + 255) / 256);
-        TRACK_DS(dsDeG);
         cmd_barrier(cmd);
 
 
@@ -1996,7 +1974,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         int pushW2[3] = {M, dim, hidden};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsW2, pushW2,
             ((M + 63) / 64) * ((dim + 63) / 64));
-        TRACK_DS(dsW2);
 
         /* ffn_out += w2_bias, x += ffn_out */
         buf_cache_entry_t *bW2B = get_cached_buffer(l->w2_bias, dim * sizeof(float));
@@ -2005,7 +1982,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsBW2, 1, bW2B->buffer, 0, dim * sizeof(float));
         struct { int d, t; } pushBW2 = {dim, n_dim};
         cmd_dispatch(cmd, PIPE_BIAS_ADD, dsBW2, &pushBW2, (n_dim + 255) / 256);
-        TRACK_DS(dsBW2);
         cmd_barrier(cmd);
 
 
@@ -2013,14 +1989,10 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsAddF, 0, pX->buffer, 0, (size_t)n_dim * sizeof(float));
         bind_buffer(dsAddF, 1, pProj->buffer, 0, (size_t)n_dim * sizeof(float));
         cmd_dispatch(cmd, PIPE_ADD_INPLACE, dsAddF, &n_dim, (n_dim + 255) / 256);
-        TRACK_DS(dsAddF);
 
         /* Submit every ENC_LAYERS_PER_SUBMIT layers or at the last layer */
         if ((layer + 1) % ENC_LAYERS_PER_SUBMIT == 0 || layer == VOX_ENC_LAYERS - 1) {
             submit_and_wait(cmd);
-            if (n_batch_ds > 0) {
-                n_batch_ds = 0;
-            }
         } else {
             cmd_barrier(cmd);
         }
