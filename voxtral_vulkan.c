@@ -597,6 +597,14 @@ static int g_vk_timing = 0;
 static double g_vk_submit_ms = 0.0;
 static uint64_t g_vk_submit_count = 0;
 
+/* GPU timestamp query profiling (optional)
+ * Enable with VOX_VK_GPU_TIMING=1.
+ */
+static int g_vk_gpu_timing = 0;
+static VkQueryPool g_ts_pool = VK_NULL_HANDLE;
+static uint32_t g_ts_capacity = 0;
+static float g_ts_period_ns = 0.0f;
+
 static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -607,8 +615,12 @@ static void vk_timing_init_once(void) {
     static int inited = 0;
     if (inited) return;
     inited = 1;
+
     const char *e = getenv("VOX_VK_TIMING");
     g_vk_timing = (e && e[0] && strcmp(e, "0") != 0);
+
+    const char *g = getenv("VOX_VK_GPU_TIMING");
+    g_vk_gpu_timing = (g && g[0] && strcmp(g, "0") != 0);
 }
 
 static void vk_timing_note_submit(double ms) {
@@ -656,6 +668,53 @@ static void cmd_dispatch(VkCommandBuffer cmd, pipeline_id_t id, VkDescriptorSet 
                        0, g_push_sizes[id], push_data);
     vkCmdDispatch(cmd, groups_x, 1, 1);
 }
+
+/* ------------------------------------------------------------------------
+ * GPU timestamp helpers
+ * ------------------------------------------------------------------------ */
+
+static void ts_ensure_capacity(uint32_t need) {
+    if (!g_vk_gpu_timing) return;
+    if (need <= g_ts_capacity) return;
+
+    /* Grow query pool: destroy old and create new.
+     * Safe because we only grow between submissions (host-side). */
+    uint32_t new_cap = g_ts_capacity ? g_ts_capacity : 1024;
+    while (new_cap < need) new_cap *= 2;
+
+    if (g_ts_pool) vkDestroyQueryPool(g_device, g_ts_pool, NULL);
+
+    VkQueryPoolCreateInfo qp = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qp.queryCount = new_cap;
+    if (vkCreateQueryPool(g_device, &qp, NULL, &g_ts_pool) != VK_SUCCESS) {
+        fprintf(stderr, "Vulkan: failed to grow timestamp query pool\n");
+        g_ts_pool = VK_NULL_HANDLE;
+        g_vk_gpu_timing = 0;
+        g_ts_capacity = 0;
+        return;
+    }
+    g_ts_capacity = new_cap;
+}
+
+static void cmd_ts(VkCommandBuffer cmd, uint32_t idx) {
+    if (!g_vk_gpu_timing || !g_ts_pool) return;
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, g_ts_pool, idx);
+}
+
+static double ts_to_ms(uint64_t ticks) {
+    return (double)ticks * (double)g_ts_period_ns / 1e6;
+}
+
+static void ts_report_pair(const char *name, uint64_t t0, uint64_t t1) {
+    if (!g_vk_gpu_timing) return;
+    if (t1 < t0) return;
+    fprintf(stderr, "  vk-gpu %-18s %.3f ms\n", name, ts_to_ms(t1 - t0));
+}
+
+/* ------------------------------------------------------------------------
+ * Barriers
+ * ------------------------------------------------------------------------ */
 
 /* Insert a memory barrier between compute dispatches */
 static void cmd_barrier(VkCommandBuffer cmd) {
@@ -776,6 +835,13 @@ int vox_vulkan_init(void) {
 
     vkGetDeviceQueue(g_device, g_queue_family, 0, &g_queue);
 
+    /* Timestamp period for GPU timing */
+    if (g_vk_gpu_timing) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(g_physical, &props);
+        g_ts_period_ns = props.limits.timestampPeriod;
+    }
+
     /* Command pool */
     VkCommandPoolCreateInfo cpci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = g_queue_family;
@@ -848,6 +914,20 @@ int vox_vulkan_init(void) {
         }
     }
 
+    /* Init timestamp query pool (optional) */
+    if (g_vk_gpu_timing) {
+        /* Start with a conservative capacity; grow on demand */
+        g_ts_capacity = 4096;
+        VkQueryPoolCreateInfo qp = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qp.queryCount = g_ts_capacity;
+        if (vkCreateQueryPool(g_device, &qp, NULL, &g_ts_pool) != VK_SUCCESS) {
+            fprintf(stderr, "Vulkan: failed to create timestamp query pool\n");
+            g_ts_pool = VK_NULL_HANDLE;
+            g_vk_gpu_timing = 0;
+        }
+    }
+
     g_initialized = 1;
 
     if (vox_verbose >= 1) {
@@ -869,6 +949,12 @@ void vox_vulkan_shutdown(void) {
     vkDeviceWaitIdle(g_device);
 
     vk_timing_report_and_reset();
+
+    if (g_ts_pool) {
+        vkDestroyQueryPool(g_device, g_ts_pool, NULL);
+        g_ts_pool = VK_NULL_HANDLE;
+    }
+    g_ts_capacity = 0;
 
     submit_ring_shutdown();
 
@@ -1775,10 +1861,33 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 #define ENC_LAYERS_PER_SUBMIT 4
     VkCommandBuffer cmd = VK_NULL_HANDLE;
 
+    /* GPU timestamp indices */
+    uint32_t ts_base = 0;
+    uint32_t ts_idx = 0;
+    if (g_vk_gpu_timing && g_ts_pool) {
+        /* Worst case: per layer we mark: layer_begin, after_attn, after_ffn, layer_end (4)
+         * plus total begin/end and final norm begin/end.
+         */
+        uint32_t need = 2 + VOX_ENC_LAYERS * 4 + 2;
+        ts_ensure_capacity(need);
+        ts_base = 0;
+        ts_idx = ts_base;
+    }
+
+    if (g_vk_gpu_timing && g_ts_pool) {
+        VkCommandBuffer rcmd = begin_cmd();
+        vkCmdResetQueryPool(rcmd, g_ts_pool, 0, g_ts_capacity);
+        submit_and_wait(rcmd);
+    }
+
     for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
         if (layer % ENC_LAYERS_PER_SUBMIT == 0) {
             cmd = begin_cmd();
+            if (g_vk_gpu_timing && g_ts_pool && layer == 0) cmd_ts(cmd, ts_idx++); /* total_begin */
         }
+
+        if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_idx++); /* layer_begin */
+
         vox_enc_layer_t *l = &enc_model->layers[layer];
 
         /* RMS norm */
@@ -1929,6 +2038,8 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
         cmd_barrier(cmd);
 
+        if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_idx++); /* after_attn */
+
         buf_cache_entry_t *bFN = get_cached_buffer(l->ffn_norm, dim * sizeof(float));
         VkDescriptorSet dsFN = alloc_descriptor_set(PIPE_RMS_NORM);
         bind_buffer(dsFN, 0, pX->buffer, 0, (size_t)n_dim * sizeof(float));
@@ -1997,8 +2108,12 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         bind_buffer(dsAddF, 1, pProj->buffer, 0, (size_t)n_dim * sizeof(float));
         cmd_dispatch(cmd, PIPE_ADD_INPLACE, dsAddF, &n_dim, (n_dim + 255) / 256);
 
+        if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_idx++); /* after_ffn */
+        if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_idx++); /* layer_end */
+
         /* Submit every ENC_LAYERS_PER_SUBMIT layers or at the last layer */
         if ((layer + 1) % ENC_LAYERS_PER_SUBMIT == 0 || layer == VOX_ENC_LAYERS - 1) {
+            if (g_vk_gpu_timing && g_ts_pool && layer == VOX_ENC_LAYERS - 1) cmd_ts(cmd, ts_idx++); /* total_end */
             submit_and_wait(cmd);
         } else {
             cmd_barrier(cmd);
@@ -2007,6 +2122,12 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
     /* Final norm */
     cmd = begin_cmd();
+    uint32_t ts_final0 = 0, ts_final1 = 0;
+    if (g_vk_gpu_timing && g_ts_pool) {
+        ts_final0 = ts_idx++;
+        ts_final1 = ts_idx++;
+        cmd_ts(cmd, ts_final0);
+    }
     buf_cache_entry_t *bFinalN = get_cached_buffer(enc_model->norm, dim * sizeof(float));
     VkDescriptorSet dsF = alloc_descriptor_set(PIPE_RMS_NORM);
     bind_buffer(dsF, 0, pX->buffer, 0, (size_t)M * dim * sizeof(float));
@@ -2015,7 +2136,42 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
     struct { int h; float e; } pushFinal = {dim, eps};
     cmd_dispatch(cmd, PIPE_RMS_NORM, dsF, &pushFinal, M);
 
+    if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_final1);
+
     submit_and_wait(cmd);
+
+    if (g_vk_gpu_timing && g_ts_pool) {
+        uint32_t n_q = ts_idx;
+        uint64_t *ticks = (uint64_t *)malloc((size_t)n_q * sizeof(uint64_t));
+        if (ticks) {
+            VkResult qr = vkGetQueryPoolResults(g_device, g_ts_pool, 0, n_q,
+                                                (size_t)n_q * sizeof(uint64_t),
+                                                ticks, sizeof(uint64_t),
+                                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (qr == VK_SUCCESS) {
+                uint32_t q = 0;
+                uint64_t total0 = ticks[q++];
+                for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
+                    uint64_t lb = ticks[q++];
+                    uint64_t a1 = ticks[q++];
+                    uint64_t f1 = ticks[q++];
+                    uint64_t le = ticks[q++];
+                    fprintf(stderr, "vk-gpu enc layer %2d: attn %.3f ms, ffn %.3f ms, total %.3f ms\n",
+                            layer,
+                            ts_to_ms(a1 - lb),
+                            ts_to_ms(le - a1),
+                            ts_to_ms(le - lb));
+                    (void)f1; /* reserved (currently included in total split) */
+                }
+                uint64_t total1 = ticks[q++];
+                ts_report_pair("enc_total", total0, total1);
+                uint64_t fn0 = ticks[q++];
+                uint64_t fn1 = ticks[q++];
+                ts_report_pair("final_norm", fn0, fn1);
+            }
+            free(ticks);
+        }
+    }
 
     memcpy(x, pXnorm->mapped, (size_t)M * dim * sizeof(float));
 
