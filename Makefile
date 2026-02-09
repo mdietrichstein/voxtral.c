@@ -68,7 +68,13 @@ OPENBLAS_BF16_FLAG = -DBUILD_BFLOAT16
 endif
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS $(OPENBLAS_INC) $(OPENBLAS_BF16_FLAG)
 blas: LDFLAGS += $(OPENBLAS_LIB) -lpthread
-SRCS += voxtral_mic_macos.c
+
+# Linux microphone capture via PipeWire (requires pipewire-devel)
+SRCS += voxtral_mic_pipewire.c
+PIPEWIRE_CFLAGS := $(shell pkg-config --cflags libpipewire-0.3 2>/dev/null)
+PIPEWIRE_LIBS   := $(shell pkg-config --libs libpipewire-0.3 2>/dev/null)
+blas: CFLAGS += $(PIPEWIRE_CFLAGS)
+blas: LDFLAGS += $(PIPEWIRE_LIBS)
 endif
 blas: clean $(TARGET)
 	@echo ""
@@ -78,8 +84,8 @@ blas: clean $(TARGET)
 # Backend: vulkan (Linux Vulkan GPU)
 # =============================================================================
 ifeq ($(UNAME_S),Linux)
-VULKAN_CFLAGS = $(CFLAGS_BASE) -Wno-missing-field-initializers -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -DUSE_GPU $(OPENBLAS_INC) $(OPENBLAS_BF16_FLAG)
-VULKAN_LDFLAGS = $(LDFLAGS) $(OPENBLAS_LIB) -lvulkan -lpthread
+VULKAN_CFLAGS = $(CFLAGS_BASE) -Wno-missing-field-initializers -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -DUSE_GPU $(OPENBLAS_INC) $(OPENBLAS_BF16_FLAG) $(PIPEWIRE_CFLAGS)
+VULKAN_LDFLAGS = $(LDFLAGS) $(OPENBLAS_LIB) -lvulkan -lpthread $(PIPEWIRE_LIBS)
 
 vulkan: clean voxtral_shaders_vk_spv.h vulkan-build
 	@echo ""
