@@ -29,7 +29,6 @@ static VkDevice g_device = VK_NULL_HANDLE;
 static VkQueue g_queue = VK_NULL_HANDLE;
 static uint32_t g_queue_family = 0;
 static VkCommandPool g_cmd_pool = VK_NULL_HANDLE;
-static VkDescriptorPool g_desc_pool = VK_NULL_HANDLE;
 static int g_initialized = 0;
 
 /* Physical device properties */
@@ -463,9 +462,9 @@ static int create_pipeline(pipeline_id_t id, const uint32_t *spirv, size_t spirv
  * Descriptor Set Allocation & Binding
  * ======================================================================== */
 
-static VkDescriptorSet alloc_descriptor_set(pipeline_id_t id) {
+static VkDescriptorSet alloc_descriptor_set_from_pool(pipeline_id_t id, VkDescriptorPool pool) {
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = g_desc_pool;
+    ai.descriptorPool = pool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &g_desc_layouts[id];
     VkDescriptorSet ds;
@@ -497,13 +496,21 @@ static void bind_buffer(VkDescriptorSet ds, int binding, VkBuffer buf,
  * Command submission: fence-based ring (avoid vkQueueWaitIdle per submit)
  * ------------------------------------------------------------------------ */
 
-static VkCommandBuffer begin_cmd_ring(void);
-
-
 #define SUBMIT_RING_SIZE 4
+
+/* Descriptor pools: one per submit ring slot.
+ * Reset when the slot fence signals to cheaply free all descriptor sets.
+ */
+static VkDescriptorPool g_desc_pool[SUBMIT_RING_SIZE];
+
+static VkCommandBuffer begin_cmd_ring(void);
 static VkCommandBuffer g_submit_cmd[SUBMIT_RING_SIZE];
 static VkFence g_submit_fence[SUBMIT_RING_SIZE];
 static int g_submit_idx = 0;
+
+static VkDescriptorSet alloc_descriptor_set(pipeline_id_t id) {
+    return alloc_descriptor_set_from_pool(id, g_desc_pool[g_submit_idx]);
+}
 
 static int submit_ring_init(void) {
     for (int i = 0; i < SUBMIT_RING_SIZE; i++) {
@@ -544,6 +551,9 @@ static VkCommandBuffer begin_cmd_ring(void) {
     if (vkWaitForFences(g_device, 1, &g_submit_fence[i], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     vkResetFences(g_device, 1, &g_submit_fence[i]);
+
+    /* Reset descriptor pool for this slot: frees all DS allocated from it */
+    vkResetDescriptorPool(g_device, g_desc_pool[i], 0);
 
     vkResetCommandBuffer(g_submit_cmd[i], 0);
 
@@ -769,7 +779,11 @@ int vox_vulkan_init(void) {
         return 0;
     }
 
-    /* Descriptor pool (large enough for all operations) */
+    /* Descriptor pools: one per submit ring slot.
+     * We reset the pool when the slot fence signals, so we don't need
+     * VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT or vkFreeDescriptorSets(). */
+    for (int i = 0; i < SUBMIT_RING_SIZE; i++) g_desc_pool[i] = VK_NULL_HANDLE;
+
     VkDescriptorPoolSize pool_sizes[] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
     };
@@ -777,18 +791,23 @@ int vox_vulkan_init(void) {
     dpci.maxSets = 2048;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = pool_sizes;
-    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    if (vkCreateDescriptorPool(g_device, &dpci, NULL, &g_desc_pool) != VK_SUCCESS) {
-        vkDestroyCommandPool(g_device, g_cmd_pool, NULL);
-        vkDestroyDevice(g_device, NULL);
-        vkDestroyInstance(g_instance, NULL);
-        return 0;
+    dpci.flags = 0;
+
+    for (int i = 0; i < SUBMIT_RING_SIZE; i++) {
+        if (vkCreateDescriptorPool(g_device, &dpci, NULL, &g_desc_pool[i]) != VK_SUCCESS) {
+            for (int j = 0; j < i; j++) vkDestroyDescriptorPool(g_device, g_desc_pool[j], NULL);
+            vkDestroyCommandPool(g_device, g_cmd_pool, NULL);
+            vkDestroyDevice(g_device, NULL);
+            vkDestroyInstance(g_instance, NULL);
+            return 0;
+        }
     }
 
     /* Init submit ring (fences + persistent command buffers) */
     if (!submit_ring_init()) {
         fprintf(stderr, "Vulkan: submit ring init failed\n");
-        vkDestroyDescriptorPool(g_device, g_desc_pool, NULL);
+        for (int i = 0; i < SUBMIT_RING_SIZE; i++)
+            if (g_desc_pool[i]) vkDestroyDescriptorPool(g_device, g_desc_pool[i], NULL);
         vkDestroyCommandPool(g_device, g_cmd_pool, NULL);
         vkDestroyDevice(g_device, NULL);
         vkDestroyInstance(g_instance, NULL);
@@ -885,7 +904,8 @@ void vox_vulkan_shutdown(void) {
         if (g_shader_modules[i]) vkDestroyShaderModule(g_device, g_shader_modules[i], NULL);
     }
 
-    vkDestroyDescriptorPool(g_device, g_desc_pool, NULL);
+    for (int i = 0; i < SUBMIT_RING_SIZE; i++)
+        if (g_desc_pool[i]) vkDestroyDescriptorPool(g_device, g_desc_pool[i], NULL);
     vkDestroyCommandPool(g_device, g_cmd_pool, NULL);
     vkDestroyDevice(g_device, NULL);
     vkDestroyInstance(g_instance, NULL);
@@ -991,7 +1011,7 @@ void vox_vulkan_sgemm_bf16(int M, int N, int K,
 
     memcpy(C, pC->mapped, sizeC);
 
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &ds);
+    /* descriptor sets freed by vkResetDescriptorPool() when ring slot is reused */
     pool_release(pA);
     pool_release(pC);
 }
@@ -1030,7 +1050,7 @@ void vox_vulkan_sgemm(int M, int N, int K,
 
     memcpy(C, pC->mapped, sizeC);
 
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &ds);
+    /* descriptor sets freed by vkResetDescriptorPool() when ring slot is reused */
     pool_release(pA);
     pool_release(pC);
 }
@@ -1101,10 +1121,6 @@ void vox_vulkan_fused_qkv_bf16(int M, int K,
     memcpy(q_out, pQ->mapped, sizeQ);
     memcpy(k_out, pK->mapped, sizeK);
     memcpy(v_out, pV->mapped, sizeV);
-
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsQ);
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsK);
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsV);
     pool_release(pIn);
     pool_release(pQ);
     pool_release(pK);
@@ -1194,12 +1210,6 @@ void vox_vulkan_fused_ffn_bf16(int M, int dim, int hidden,
     submit_and_wait(cmd);
 
     memcpy(output, pOut->mapped, sizeOut);
-
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsGate);
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsUp);
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsSilu);
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsMul);
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsOut);
     pool_release(pIn);
     pool_release(pGate);
     pool_release(pUp);
@@ -1254,8 +1264,6 @@ void vox_vulkan_encoder_attention(float *out,
     submit_and_wait(cmd);
 
     memcpy(out, pO->mapped, out_size);
-
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &ds);
     pool_release(pQ);
     pool_release(pK);
     pool_release(pV);
@@ -1353,7 +1361,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             bind_buffer(dsWo, 2, pProj->buffer, 0, dim * sizeof(float));
             int pushWo[3] = {1, dim, q_dim};
             cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsWo, pushWo, ((dim + 63) / 64));
-            vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsWo);
             cmd_barrier(cmd);
 
             /* x += proj */
@@ -1361,7 +1368,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             bind_buffer(dsAdd, 0, pX->buffer, 0, dim * sizeof(float));
             bind_buffer(dsAdd, 1, pProj->buffer, 0, dim * sizeof(float));
             cmd_dispatch(cmd, PIPE_ADD_INPLACE, dsAdd, &dim, (dim + 255) / 256);
-            vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsAdd);
             cmd_barrier(cmd);
 
             /* x_norm = rms_norm(x, ffn_norm) */
@@ -1372,7 +1378,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             bind_buffer(dsNorm, 2, pXnorm->buffer, 0, dim * sizeof(float));
             struct { int h; float e; } pushN = {dim, eps};
             cmd_dispatch(cmd, PIPE_RMS_NORM, dsNorm, &pushN, 1);
-            vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsNorm);
             cmd_barrier(cmd);
 
             /* ada_scale if present */
@@ -1383,7 +1388,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
                 bind_buffer(dsAda, 1, bAda->buffer, 0, dim * sizeof(float));
                 struct { int n, s; } pushA = {dim, dim};
                 cmd_dispatch(cmd, PIPE_ADA_SCALE_MUL, dsAda, &pushA, (dim + 255) / 256);
-                vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsAda);
                 cmd_barrier(cmd);
             }
 
@@ -1398,7 +1402,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             bind_buffer(dsFFN, 2, pGate->buffer, 0, hidden2 * sizeof(float));
             int pushFFN[3] = {1, hidden2, dim};
             cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsFFN, pushFFN, (hidden2 + 63) / 64);
-            vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsFFN);
             cmd_barrier(cmd);
 
             /* silu_mul_merged */
@@ -1406,7 +1409,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             bind_buffer(dsSM, 0, pGate->buffer, 0, hidden2 * sizeof(float));
             struct { int h, t; } pushSM = {hidden, hidden};
             cmd_dispatch(cmd, PIPE_SILU_MUL_MERGED, dsSM, &pushSM, (hidden + 255) / 256);
-            vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsSM);
             cmd_barrier(cmd);
 
             /* ffn_out = gate @ w2^T */
@@ -1418,7 +1420,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             bind_buffer(dsW2, 2, pFfnOut->buffer, 0, dim * sizeof(float));
             int pushW2[3] = {1, dim, hidden};
             cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsW2, pushW2, (dim + 63) / 64);
-            vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsW2);
             cmd_barrier(cmd);
 
             /* x += ffn_out */
@@ -1426,7 +1427,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             bind_buffer(dsAdd2, 0, pX->buffer, 0, dim * sizeof(float));
             bind_buffer(dsAdd2, 1, pFfnOut->buffer, 0, dim * sizeof(float));
             cmd_dispatch(cmd, PIPE_ADD_INPLACE, dsAdd2, &dim, (dim + 255) / 256);
-            vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsAdd2);
             cmd_barrier(cmd);
         }
 
@@ -1438,7 +1438,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsAN, 2, pXnorm->buffer, 0, dim * sizeof(float));
         struct { int h; float e; } pushAN = {dim, eps};
         cmd_dispatch(cmd, PIPE_RMS_NORM, dsAN, &pushAN, 1);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsAN);
         cmd_barrier(cmd);
 
         /* QKV = x_norm @ [Wq;Wk;Wv]^T */
@@ -1451,7 +1450,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsQKV, 2, pQKV->buffer, 0, qkv_total * sizeof(float));
         int pushQKV[3] = {1, qkv_total, dim};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsQKV, pushQKV, (qkv_total + 63) / 64);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsQKV);
         cmd_barrier(cmd);
 
         /* RoPE on Q (offset 0 in QKV buffer) */
@@ -1461,7 +1459,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         struct { int nh, hd, off; } pushRQ = {n_heads, head_dim, 0};
         int n_rope_q = n_heads * (head_dim / 2);
         cmd_dispatch(cmd, PIPE_ROPE_APPLY, dsRopeQ, &pushRQ, (n_rope_q + 255) / 256);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsRopeQ);
 
         /* RoPE on K (offset q_dim in QKV buffer) */
         VkDescriptorSet dsRopeK = alloc_descriptor_set(PIPE_ROPE_APPLY);
@@ -1470,7 +1467,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         struct { int nh, hd, off; } pushRK = {n_kv_heads, head_dim, q_dim};
         int n_rope_k = n_kv_heads * (head_dim / 2);
         cmd_dispatch(cmd, PIPE_ROPE_APPLY, dsRopeK, &pushRK, (n_rope_k + 255) / 256);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsRopeK);
         cmd_barrier(cmd);
 
         /* KV cache write (K at offset q_dim*4 in QKV, V at offset (q_dim+kv_dim)*4) */
@@ -1482,7 +1478,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsCopyK, 1, pQKV->buffer, q_dim * sizeof(float), kv_dim * sizeof(float));
         struct { int off, tot; } pushCK = {kv_float_offset, kv_dim};
         cmd_dispatch(cmd, PIPE_KV_CACHE_COPY, dsCopyK, &pushCK, (kv_dim + 255) / 256);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsCopyK);
 
         /* Copy V to cache */
         VkDescriptorSet dsCopyV = alloc_descriptor_set(PIPE_KV_CACHE_COPY);
@@ -1490,7 +1485,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsCopyV, 1, pQKV->buffer, (q_dim + kv_dim) * sizeof(float), kv_dim * sizeof(float));
         struct { int off, tot; } pushCV = {kv_float_offset, kv_dim};
         cmd_dispatch(cmd, PIPE_KV_CACHE_COPY, dsCopyV, &pushCV, (kv_dim + 255) / 256);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsCopyV);
         cmd_barrier(cmd);
 
         /* Attention */
@@ -1510,7 +1504,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             VOX_DEC_WINDOW, q_pos_val
         };
         cmd_dispatch(cmd, PIPE_DECODER_ATTENTION, dsAttn, &pushAttn, n_heads);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsAttn);
 
         submit_and_wait(cmd);
     }
@@ -1531,7 +1524,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsWo, 2, pProj->buffer, 0, dim * sizeof(float));
         int pushWo[3] = {1, dim, q_dim};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsWo, pushWo, (dim + 63) / 64);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsWo);
         cmd_barrier(cmd);
 
         /* x += proj */
@@ -1539,7 +1531,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsAdd, 0, pX->buffer, 0, dim * sizeof(float));
         bind_buffer(dsAdd, 1, pProj->buffer, 0, dim * sizeof(float));
         cmd_dispatch(cmd, PIPE_ADD_INPLACE, dsAdd, &dim, (dim + 255) / 256);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsAdd);
         cmd_barrier(cmd);
 
         /* FFN norm */
@@ -1550,7 +1541,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsNorm, 2, pXnorm->buffer, 0, dim * sizeof(float));
         struct { int h; float e; } pushN = {dim, eps};
         cmd_dispatch(cmd, PIPE_RMS_NORM, dsNorm, &pushN, 1);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsNorm);
         cmd_barrier(cmd);
 
         if (ada_s) {
@@ -1560,7 +1550,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
             bind_buffer(dsAda, 1, bAda->buffer, 0, dim * sizeof(float));
             struct { int n, s; } pushA = {dim, dim};
             cmd_dispatch(cmd, PIPE_ADA_SCALE_MUL, dsAda, &pushA, (dim + 255) / 256);
-            vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsAda);
             cmd_barrier(cmd);
         }
 
@@ -1575,14 +1564,12 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsFFN, 2, pGate->buffer, 0, hidden2 * sizeof(float));
         int pushFFN[3] = {1, hidden2, dim};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsFFN, pushFFN, (hidden2 + 63) / 64);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsFFN);
         cmd_barrier(cmd);
 
         VkDescriptorSet dsSM = alloc_descriptor_set(PIPE_SILU_MUL_MERGED);
         bind_buffer(dsSM, 0, pGate->buffer, 0, hidden2 * sizeof(float));
         struct { int h, t; } pushSM = {hidden, hidden};
         cmd_dispatch(cmd, PIPE_SILU_MUL_MERGED, dsSM, &pushSM, (hidden + 255) / 256);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsSM);
         cmd_barrier(cmd);
 
         buf_cache_entry_t *bW2 = get_cached_buffer(last->w2_weight_bf16,
@@ -1593,7 +1580,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsW2, 2, pFfnOut->buffer, 0, dim * sizeof(float));
         int pushW2[3] = {1, dim, hidden};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsW2, pushW2, (dim + 63) / 64);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsW2);
         cmd_barrier(cmd);
 
         /* x += ffn_out */
@@ -1601,7 +1587,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsAdd2, 0, pX->buffer, 0, dim * sizeof(float));
         bind_buffer(dsAdd2, 1, pFfnOut->buffer, 0, dim * sizeof(float));
         cmd_dispatch(cmd, PIPE_ADD_INPLACE, dsAdd2, &dim, (dim + 255) / 256);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsAdd2);
         cmd_barrier(cmd);
 
         /* Final norm */
@@ -1612,7 +1597,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsF, 2, pXnorm->buffer, 0, dim * sizeof(float));
         struct { int h; float e; } pushF = {dim, eps};
         cmd_dispatch(cmd, PIPE_RMS_NORM, dsF, &pushF, 1);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsF);
         cmd_barrier(cmd);
 
         /* Logits = x_norm @ tok_emb^T */
@@ -1624,7 +1608,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsLog, 2, pLogits->buffer, 0, (size_t)VOX_VOCAB_SIZE * sizeof(float));
         int pushLog[3] = {1, VOX_VOCAB_SIZE, dim};
         cmd_dispatch(cmd, PIPE_MATMUL_BF16, dsLog, pushLog, (VOX_VOCAB_SIZE + 63) / 64);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsLog);
         cmd_barrier(cmd);
 
         /* Argmax */
@@ -1633,7 +1616,6 @@ int vox_vulkan_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *
         bind_buffer(dsArg, 1, pArgmax->buffer, 0, sizeof(int));
         int vocab = VOX_VOCAB_SIZE;
         cmd_dispatch(cmd, PIPE_ARGMAX, dsArg, &vocab, 1);
-        vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsArg);
 
         submit_and_wait(cmd);
     }
@@ -2037,7 +2019,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         if ((layer + 1) % ENC_LAYERS_PER_SUBMIT == 0 || layer == VOX_ENC_LAYERS - 1) {
             submit_and_wait(cmd);
             if (n_batch_ds > 0) {
-                vkFreeDescriptorSets(g_device, g_desc_pool, n_batch_ds, batch_ds);
                 n_batch_ds = 0;
             }
         } else {
@@ -2056,7 +2037,6 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
     cmd_dispatch(cmd, PIPE_RMS_NORM, dsF, &pushFinal, M);
 
     submit_and_wait(cmd);
-    vkFreeDescriptorSets(g_device, g_desc_pool, 1, &dsF);
 
     memcpy(x, pXnorm->mapped, (size_t)M * dim * sizeof(float));
 
