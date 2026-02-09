@@ -1,0 +1,25 @@
+/*
+ * Deinterleave: copy one column slice from [M, total_cols] to [M, chunk_cols].
+ * total threads = M * chunk_cols.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufSrc { float src[]; };
+layout(set = 0, binding = 1) writeonly buffer BufDst { float dst[]; };
+
+layout(push_constant) uniform Params {
+    int src_stride;   /* total cols per src row */
+    int chunk_cols;   /* cols to copy per row */
+    int col_offset;   /* start column in src row */
+    int total;        /* M * chunk_cols */
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (int(gid) >= total) return;
+    int row = int(gid) / chunk_cols;
+    int col = int(gid) % chunk_cols;
+    dst[gid] = src[row * src_stride + col_offset + col];
+}

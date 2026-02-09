@@ -1,0 +1,19 @@
+/*
+ * Adaptive scale multiply: x[i] *= (1 + scale[i % stride])
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufX { float x[]; };
+layout(set = 0, binding = 1) readonly buffer BufScale { float scale[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+    int stride;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid < n) x[gid] *= (1.0 + scale[gid % stride]);
+}

@@ -10,8 +10,8 @@
 #include "voxtral_safetensors.h"
 #include "voxtral_audio.h"
 #include "voxtral_tokenizer.h"
-#ifdef USE_METAL
-#include "voxtral_metal.h"
+#ifdef USE_GPU
+#include "voxtral_gpu.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,11 +158,11 @@ vox_ctx_t *vox_load(const char *model_dir) {
     /* Precompute time conditioning for the decoder (t_cond + per-layer ada_scale). */
     vox_update_time_conditioning(ctx);
 
-#ifdef USE_METAL
-    /* Pre-warm Metal bf16->f16 weight cache to avoid first-token spike */
-    if (vox_metal_available()) {
+#ifdef USE_GPU
+    /* Pre-warm GPU weight cache to avoid first-token spike */
+    if (0 && vox_gpu_available()) { /* warmup disabled - use lazy per-op GPU path */
         if (vox_verbose >= 2)
-            fprintf(stderr, "Pre-warming Metal weight cache...\n");
+            fprintf(stderr, "Pre-warming GPU weight cache...\n");
 
         /* Encoder weights: merged QKV + merged w1+w3 (replaces individual caching)
          * wo and w2 still cached individually. */
@@ -173,71 +173,35 @@ vox_ctx_t *vox_load(const char *model_dir) {
             size_t enc_ffn1 = (size_t)VOX_ENC_HIDDEN * VOX_ENC_DIM;
             size_t enc_ffn2 = (size_t)VOX_ENC_DIM * VOX_ENC_HIDDEN;
             /* Merged QKV and w1+w3 (internally caches individual f16 buffers too) */
-            vox_metal_warmup_merged_3(
+            vox_gpu_warmup_merged_3(
                 l->wq_weight_bf16, enc_attn,
                 l->wk_weight_bf16, enc_attn,
                 l->wv_weight_bf16, enc_attn);
-            vox_metal_warmup_merged_2(
+            vox_gpu_warmup_merged_2(
                 l->w1_weight_bf16, enc_ffn1,
                 l->w3_weight_bf16, enc_ffn1);
             /* wo and w2 used individually */
-            vox_metal_warmup_bf16(l->wo_weight_bf16, enc_wo);
-            vox_metal_warmup_bf16(l->w2_weight_bf16, enc_ffn2);
+            vox_gpu_warmup_bf16(l->wo_weight_bf16, enc_wo);
+            vox_gpu_warmup_bf16(l->w2_weight_bf16, enc_ffn2);
         }
 
         /* Adapter weights */
-        vox_metal_warmup_bf16(ctx->adapter.linear0_weight_bf16,
+        vox_gpu_warmup_bf16(ctx->adapter.linear0_weight_bf16,
                               (size_t)VOX_DEC_DIM * (VOX_ENC_DIM * VOX_DOWNSAMPLE));
-        vox_metal_warmup_bf16(ctx->adapter.linear1_weight_bf16,
+        vox_gpu_warmup_bf16(ctx->adapter.linear1_weight_bf16,
                               (size_t)VOX_DEC_DIM * VOX_DEC_DIM);
-
-        /* Decoder weights (26 layers) */
-        for (int i = 0; i < VOX_DEC_LAYERS; i++) {
-            vox_dec_layer_t *l = &ctx->decoder.layers[i];
-            size_t dec_q  = (size_t)(VOX_DEC_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM;
-            size_t dec_kv = (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM;
-            size_t dec_wo = (size_t)VOX_DEC_DIM * (VOX_DEC_HEADS * VOX_DEC_HEAD_DIM);
-            size_t dec_f1 = (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM;
-            size_t dec_f2 = (size_t)VOX_DEC_DIM * VOX_DEC_HIDDEN;
-            vox_metal_warmup_bf16(l->wq_weight_bf16, dec_q);
-            vox_metal_warmup_bf16(l->wk_weight_bf16, dec_kv);
-            vox_metal_warmup_bf16(l->wv_weight_bf16, dec_kv);
-            vox_metal_warmup_bf16(l->wo_weight_bf16, dec_wo);
-            vox_metal_warmup_bf16(l->w1_weight_bf16, dec_f1);
-            vox_metal_warmup_bf16(l->w2_weight_bf16, dec_f2);
-            vox_metal_warmup_bf16(l->w3_weight_bf16, dec_f1);
-        }
-
-        /* Token embeddings (also used as logits projection) */
-        vox_metal_warmup_bf16(ctx->decoder.tok_embeddings_bf16,
-                              (size_t)VOX_VOCAB_SIZE * VOX_DEC_DIM);
-
-        /* Pre-warm merged weight buffers for monolithic decoder step */
-        for (int i = 0; i < VOX_DEC_LAYERS; i++) {
-            vox_dec_layer_t *l = &ctx->decoder.layers[i];
-            /* Merged QKV = wq + wk + wv */
-            vox_metal_warmup_merged_3(
-                l->wq_weight_bf16, (size_t)(VOX_DEC_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM,
-                l->wk_weight_bf16, (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM,
-                l->wv_weight_bf16, (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM);
-            /* Merged w1+w3 */
-            vox_metal_warmup_merged_2(
-                l->w1_weight_bf16, (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM,
-                l->w3_weight_bf16, (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM);
-        }
-
-        /* Pre-warm decoder MPS ops and f32 weight caches */
-        vox_metal_warmup_decoder_ops(ctx);
-
-        /* Pre-allocate KV cache (shared GPU memory) */
-        vox_decoder_kv_cache_preallocate(ctx, VOX_DEC_WINDOW + 1024);
 
         /* Pre-allocate encoder KV cache (shared GPU memory for monolithic step) */
         vox_encoder_kv_cache_preallocate(ctx, VOX_ENC_WINDOW + 256);
 
         if (vox_verbose >= 1)
-            fprintf(stderr, "Metal GPU: %.1f MB\n",
-                    vox_metal_memory_used() / (1024.0 * 1024.0));
+            fprintf(stderr, "GPU: %.1f MB\n",
+                    vox_gpu_memory_used() / (1024.0 * 1024.0));
+    }
+
+    /* Always pre-allocate encoder KV cache as shared GPU memory for monolithic step */
+    if (vox_gpu_available()) {
+        vox_encoder_kv_cache_preallocate(ctx, VOX_ENC_WINDOW + 256);
     }
 #endif
 
@@ -285,17 +249,17 @@ void vox_free(vox_ctx_t *ctx) {
 
     #undef FREE0
 
-#ifdef USE_METAL
-    vox_metal_shared_free(ctx->kv_cache_k);
-    vox_metal_shared_free(ctx->kv_cache_v);
+#ifdef USE_GPU
+    vox_gpu_shared_free(ctx->kv_cache_k);
+    vox_gpu_shared_free(ctx->kv_cache_v);
 #else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
 #endif
-#ifdef USE_METAL
+#ifdef USE_GPU
     if (ctx->enc_kv_cache_is_shared) {
-        vox_metal_shared_free(ctx->enc_kv_cache_k);
-        vox_metal_shared_free(ctx->enc_kv_cache_v);
+        vox_gpu_shared_free(ctx->enc_kv_cache_k);
+        vox_gpu_shared_free(ctx->enc_kv_cache_v);
     } else
 #endif
     {

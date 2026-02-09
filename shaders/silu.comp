@@ -1,0 +1,20 @@
+/*
+ * SiLU activation: x = x / (1 + exp(-x)), in-place.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufX { float x[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid < n) {
+        float val = x[gid];
+        x[gid] = val / (1.0 + exp(-val));
+    }
+}

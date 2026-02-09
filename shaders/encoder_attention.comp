@@ -1,0 +1,129 @@
+/*
+ * Q-tiled batched attention: one workgroup per (head, query_block).
+ * Processes BQ queries per workgroup, amortizing K/V memory reads.
+ * Q/K/V layout: [seq, n_heads * head_dim] packed (head-interleaved).
+ * Uses online softmax, cooperative subgroup dot products.
+ *
+ * Grid: n_heads * ceil(seq_q / BQ) workgroups.
+ * group_idx = h * n_q_blocks + qb.
+ */
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define BQ 8
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer BufQ { float Q[]; };
+layout(set = 0, binding = 1) readonly buffer BufK { float K_data[]; };
+layout(set = 0, binding = 2) readonly buffer BufV { float V_data[]; };
+layout(set = 0, binding = 3) writeonly buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int seq_q;
+    int seq_k;
+    float scale;
+    int window_size;
+    int q_offset;
+};
+
+/* Shared memory for cross-subgroup dot product reduction */
+shared float tg_simd[2 * BQ]; /* 2 subgroups * BQ scores */
+shared float tg_scores[BQ];
+
+void main() {
+    uint group_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint tg_size = gl_WorkGroupSize.x;
+
+    int n_q_blocks = (seq_q + BQ - 1) / BQ;
+    int h = int(group_idx) / n_q_blocks;
+    int qb = int(group_idx) % n_q_blocks;
+    int qi_start = qb * BQ;
+    if (h >= n_heads) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_h = h / gqa_ratio;
+    int stride_q = n_heads * head_dim;
+    int stride_kv = n_kv_heads * head_dim;
+    int n_subgroups = int(tg_size) / int(gl_SubgroupSize);
+
+    /* Load BQ query values (one head_dim element per thread, BQ queries) */
+    float q_vals[BQ];
+    for (int b = 0; b < BQ; b++) {
+        int qi = qi_start + b;
+        q_vals[b] = (qi < seq_q && int(tid) < head_dim)
+            ? Q[qi * stride_q + h * head_dim + tid] : 0.0;
+    }
+
+    /* Per-query online softmax state */
+    float rmax[BQ], rsum[BQ], acc_val[BQ];
+    for (int b = 0; b < BQ; b++) {
+        rmax[b] = -1.0 / 0.0;
+        rsum[b] = 0.0;
+        acc_val[b] = 0.0;
+    }
+
+    /* Compute loop range: union of all BQ queries' valid key ranges */
+    int last_qi = min(qi_start + BQ - 1, seq_q - 1);
+    int first_pos = q_offset + qi_start;
+    int last_pos = q_offset + last_qi;
+    int loop_start = (window_size > 0) ? max(0, first_pos - window_size + 1) : 0;
+    int loop_end = min(last_pos, seq_k - 1);
+
+    for (int j = loop_start; j <= loop_end; j++) {
+        float k_val = (int(tid) < head_dim)
+            ? K_data[j * stride_kv + kv_h * head_dim + tid] : 0.0;
+
+        /* BQ dot products via subgroupAdd + cross-subgroup store */
+        for (int b = 0; b < BQ; b++) {
+            float simd_dot = subgroupAdd(q_vals[b] * k_val);
+            if (gl_SubgroupInvocationID == 0)
+                tg_simd[gl_SubgroupID * BQ + b] = simd_dot;
+        }
+        barrier();
+
+        /* Cross-subgroup reduction */
+        if (int(tid) < BQ) {
+            float sum = 0.0;
+            for (int g = 0; g < n_subgroups; g++)
+                sum += tg_simd[g * BQ + int(tid)];
+            tg_scores[int(tid)] = sum * scale;
+        }
+        barrier();
+
+        /* Load V once for this key position */
+        float v_val = (int(tid) < head_dim)
+            ? V_data[j * stride_kv + kv_h * head_dim + tid] : 0.0;
+
+        /* Update BQ online softmax + accumulate weighted V */
+        for (int b = 0; b < BQ; b++) {
+            int qi = qi_start + b;
+            if (qi >= seq_q) continue;
+            int q_pos = q_offset + qi;
+            int vs = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+            if (j < vs || j > q_pos) continue;
+
+            float score = tg_scores[b];
+            float old_max = rmax[b];
+            rmax[b] = max(rmax[b], score);
+            float corr = exp(old_max - rmax[b]);
+            rsum[b] = rsum[b] * corr + exp(score - rmax[b]);
+            acc_val[b] = acc_val[b] * corr + exp(score - rmax[b]) * v_val;
+        }
+    }
+
+    /* Write BQ outputs */
+    if (int(tid) < head_dim) {
+        for (int b = 0; b < BQ; b++) {
+            int qi = qi_start + b;
+            if (qi < seq_q) {
+                out_data[qi * stride_q + h * head_dim + tid] =
+                    acc_val[b] / (rsum[b] + 1e-10);
+            }
+        }
+    }
+}

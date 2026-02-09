@@ -1,0 +1,28 @@
+/*
+ * Fused SiLU + multiply for merged w1+w3 output.
+ * Data layout: [M, hidden*2] where each row is [gate(hidden), up(hidden)].
+ * gate = silu(gate), gate *= up.  In-place.
+ * total threads = M * hidden.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufData { float data[]; };
+
+layout(push_constant) uniform Params {
+    int hidden;
+    int total;      /* M * hidden */
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (int(gid) >= total) return;
+    int row = int(gid) / hidden;
+    int col = int(gid) % hidden;
+    int idx_gate = row * hidden * 2 + col;
+    int idx_up = idx_gate + hidden;
+    float g = data[idx_gate];
+    g = g / (1.0 + exp(-g)); /* silu */
+    data[idx_gate] = g * data[idx_up];
+}

@@ -8,8 +8,8 @@
 #include "voxtral_kernels.h"
 #include "voxtral_audio.h"
 #include "voxtral_mic.h"
-#ifdef USE_METAL
-#include "voxtral_metal.h"
+#ifdef USE_GPU
+#include "voxtral_gpu.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -171,8 +171,8 @@ int main(int argc, char **argv) {
     vox_verbose = verbosity;
     vox_verbose_audio = (verbosity >= 2) ? 1 : 0;
 
-#ifdef USE_METAL
-    vox_metal_init();
+#ifdef USE_GPU
+    vox_gpu_init();
 #endif
 
     /* Load model */
@@ -385,8 +385,8 @@ int main(int argc, char **argv) {
 
     vox_stream_free(s);
     vox_free(ctx);
-#ifdef USE_METAL
-    vox_metal_shutdown();
+#ifdef USE_GPU
+    vox_gpu_shutdown();
 #endif
     return 0;
 }

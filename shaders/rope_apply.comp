@@ -1,0 +1,37 @@
+/*
+ * RoPE: apply rotary position embedding in-place (single position).
+ * data: [n_heads * head_dim], freqs: [head_dim/2 * 2] = (cos,sin) pairs.
+ * One thread per (head, half_dim_index) pair.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufData { float data[]; };
+layout(set = 0, binding = 1) readonly buffer BufFreqs { float freqs[]; };
+
+layout(push_constant) uniform Params {
+    int n_heads;
+    int head_dim;
+    int data_offset; /* byte offset into data buffer (in floats) */
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int half_dim = head_dim / 2;
+    int total = n_heads * half_dim;
+    if (int(gid) >= total) return;
+
+    int head = int(gid) / half_dim;
+    int i = int(gid) % half_dim;
+
+    float cos_val = freqs[i * 2];
+    float sin_val = freqs[i * 2 + 1];
+
+    int base = data_offset + head * head_dim;
+    float x0 = data[base + i * 2];
+    float x1 = data[base + i * 2 + 1];
+
+    data[base + i * 2]     = x0 * cos_val - x1 * sin_val;
+    data[base + i * 2 + 1] = x0 * sin_val + x1 * cos_val;
+}

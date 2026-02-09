@@ -1,0 +1,43 @@
+/*
+ * Argmax over a float array. One workgroup, result in out[0].
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufData { float data[]; };
+layout(set = 0, binding = 1) writeonly buffer BufOut { int out_idx[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+};
+
+shared float shared_val[256];
+shared int shared_idx[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    float best_val = -1.0 / 0.0; /* -inf */
+    int best_idx = 0;
+    for (int i = int(tid); i < n; i += int(threads)) {
+        float v = data[i];
+        if (v > best_val) { best_val = v; best_idx = i; }
+    }
+    shared_val[tid] = best_val;
+    shared_idx[tid] = best_idx;
+    barrier();
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (shared_val[tid + stride] > shared_val[tid]) {
+                shared_val[tid] = shared_val[tid + stride];
+                shared_idx[tid] = shared_idx[tid + stride];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0) out_idx[0] = shared_idx[0];
+}

@@ -1,0 +1,86 @@
+/*
+ * Single-token decoder attention (seq_q=1).
+ * One workgroup per query head, 128 threads cooperate on dot products.
+ * K/V read from the KV cache buffer at a per-layer offset.
+ * Uses online softmax (single pass).
+ *
+ * Subgroup operations (wave64 on RDNA3) used for fast reductions.
+ */
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer BufQ { float Q[]; };
+layout(set = 0, binding = 1) readonly buffer BufK { float K_cache[]; };
+layout(set = 0, binding = 2) readonly buffer BufV { float V_cache[]; };
+layout(set = 0, binding = 3) writeonly buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int kv_dim;
+    int seq_k;
+    float scale;
+    int window_size;
+    int q_pos;
+};
+
+shared float shared_score[4]; /* for cross-subgroup reduction */
+
+void main() {
+    uint head_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (int(head_idx) >= n_heads) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_head = int(head_idx) / gqa_ratio;
+
+    int valid_end = min(q_pos, seq_k - 1);
+    int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+
+    /* Each thread loads one Q element (head_dim=128) */
+    float q_val = (int(tid) < head_dim) ? Q[head_idx * head_dim + tid] : 0.0;
+
+    /* Online softmax: single pass over keys */
+    float running_max = -1.0 / 0.0;
+    float running_sum = 0.0;
+    float acc = 0.0;
+
+    for (int j = valid_start; j <= valid_end; j++) {
+        /* Cooperative dot product using subgroup reduction */
+        float partial = (int(tid) < head_dim) ?
+            q_val * K_cache[j * kv_dim + kv_head * head_dim + tid] : 0.0;
+        float dot = subgroupAdd(partial);
+
+        /* Cross-subgroup reduction (128 threads = 2 subgroups of 64) */
+        uint sg_id = gl_SubgroupID;
+        if (gl_SubgroupInvocationID == 0) shared_score[sg_id] = dot;
+        barrier();
+        float score;
+        if (tid == 0) {
+            shared_score[0] = (shared_score[0] + shared_score[1]) * scale;
+        }
+        barrier();
+        score = shared_score[0];
+
+        /* Online softmax update */
+        float old_max = running_max;
+        running_max = max(running_max, score);
+        float correction = exp(old_max - running_max);
+        running_sum = running_sum * correction + exp(score - running_max);
+        acc = acc * correction;
+
+        /* Accumulate weighted V */
+        if (int(tid) < head_dim) {
+            acc += exp(score - running_max) *
+                   V_cache[j * kv_dim + kv_head * head_dim + tid];
+        }
+    }
+
+    /* Write output */
+    if (int(tid) < head_dim) {
+        out_data[head_idx * head_dim + tid] = acc / (running_sum + 1e-10);
+    }
+}

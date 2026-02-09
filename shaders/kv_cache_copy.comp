@@ -1,0 +1,22 @@
+/*
+ * KV cache copy: write data to cache at an offset.
+ * cache[float_offset + gid] = data[gid] for gid < total.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufCache { float cache[]; };
+layout(set = 0, binding = 1) readonly buffer BufData { float data[]; };
+
+layout(push_constant) uniform Params {
+    int float_offset;
+    int total;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (int(gid) < total) {
+        cache[float_offset + gid] = data[gid];
+    }
+}

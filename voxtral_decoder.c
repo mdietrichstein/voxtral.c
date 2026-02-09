@@ -16,8 +16,8 @@
 #include "voxtral.h"
 #include "voxtral_kernels.h"
 #include "voxtral_safetensors.h"
-#ifdef USE_METAL
-#include "voxtral_metal.h"
+#ifdef USE_GPU
+#include "voxtral_gpu.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,10 +115,10 @@ static int kv_cache_init(vox_ctx_t *ctx, int max_seq) {
     int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM; /* 8 * 128 = 1024 */
     size_t cache_size = (size_t)VOX_DEC_LAYERS * max_seq * kv_dim * sizeof(float);
 
-#ifdef USE_METAL
-    if (vox_metal_available()) {
-        ctx->kv_cache_k = (float *)vox_metal_shared_alloc(cache_size);
-        ctx->kv_cache_v = (float *)vox_metal_shared_alloc(cache_size);
+#ifdef USE_GPU
+    if (vox_gpu_available()) {
+        ctx->kv_cache_k = (float *)vox_gpu_shared_alloc(cache_size);
+        ctx->kv_cache_v = (float *)vox_gpu_shared_alloc(cache_size);
     } else
 #endif
     {
@@ -151,10 +151,10 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
     size_t total = (size_t)VOX_DEC_LAYERS * new_stride * sizeof(float);
 
     float *new_k, *new_v;
-#ifdef USE_METAL
-    if (vox_metal_available()) {
-        new_k = (float *)vox_metal_shared_alloc(total);
-        new_v = (float *)vox_metal_shared_alloc(total);
+#ifdef USE_GPU
+    if (vox_gpu_available()) {
+        new_k = (float *)vox_gpu_shared_alloc(total);
+        new_v = (float *)vox_gpu_shared_alloc(total);
     } else
 #endif
     {
@@ -162,9 +162,9 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
         new_v = (float *)calloc(1, total);
     }
     if (!new_k || !new_v) {
-#ifdef USE_METAL
-        vox_metal_shared_free(new_k);
-        vox_metal_shared_free(new_v);
+#ifdef USE_GPU
+        vox_gpu_shared_free(new_k);
+        vox_gpu_shared_free(new_v);
 #else
         free(new_k); free(new_v);
 #endif
@@ -177,9 +177,9 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
         memcpy(new_v + l * new_stride, ctx->kv_cache_v + l * old_stride, copy);
     }
 
-#ifdef USE_METAL
-    vox_metal_shared_free(ctx->kv_cache_k);
-    vox_metal_shared_free(ctx->kv_cache_v);
+#ifdef USE_GPU
+    vox_gpu_shared_free(ctx->kv_cache_k);
+    vox_gpu_shared_free(ctx->kv_cache_v);
 #else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
@@ -268,9 +268,9 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
 
     /* GPU monolithic prefill: all 26 layers in one command buffer */
-#ifdef USE_METAL
-    if (vox_metal_available()) {
-        vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
+#ifdef USE_GPU
+    if (vox_gpu_available() && vox_gpu_decoder_prefill_available()) {
+        vox_gpu_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
         free(x); free(x_norm); free(q); free(k); free(v);
         free(attn_out); free(proj_out); free(ffn_out);
         free(positions); free(rope_freqs);
@@ -285,20 +285,10 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         vox_rms_norm(x_norm, x, l->attention_norm, seq_len, dim, VOX_DEC_NORM_EPS);
 
         /* Q, K, V projections (no bias in decoder, bf16 weights) */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_qkv_bf16(seq_len, dim, x_norm,
-                                      l->wq_weight_bf16, q_dim,
-                                      l->wk_weight_bf16, kv_dim,
-                                      l->wv_weight_bf16, kv_dim,
-                                      q, k, v);
-        } else
-#endif
-        {
-            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
-            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
-        }
+        /* CPU BLAS for decoder prefill — GPU weight caching would duplicate 5.6GB */
+        vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
+        vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
+        vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
 
         /* Apply RoPE */
         vox_apply_rope(q, rope_freqs, seq_len, n_heads, head_dim);
@@ -338,16 +328,8 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
             }
         }
 
-        /* SwiGLU */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_ffn_bf16(seq_len, dim, hidden, x_norm,
-                                      l->w1_weight_bf16, l->w3_weight_bf16,
-                                      l->w2_weight_bf16, ffn_out);
-        } else
-#endif
+        /* SwiGLU — CPU BLAS for decoder (GPU would duplicate 5.6GB of decoder weights) */
         {
-            /* CPU path needs separate gate/up buffers */
             float *gate = (float *)malloc(seq_len * hidden * sizeof(float));
             float *up = (float *)malloc(seq_len * hidden * sizeof(float));
             vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
@@ -444,14 +426,14 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
-#ifdef USE_METAL
-    if (vox_metal_available()) {
+#ifdef USE_GPU
+    if (vox_gpu_available()) {
         /* Try monolithic GPU path: all 26 layers + logits in ONE command buffer.
          * RoPE, KV cache writes, and attention all run on GPU.
-         * Requires shared KV cache (allocated via vox_metal_shared_alloc). */
-        vox_metal_decoder_start(x, dim);
-        int token = vox_metal_decoder_full_step(ctx, rope_freqs, logits);
-        vox_metal_decoder_end();
+         * Requires shared KV cache (allocated via vox_gpu_shared_alloc). */
+        vox_gpu_decoder_start(x, dim);
+        int token = vox_gpu_decoder_full_step(ctx, rope_freqs, logits);
+        vox_gpu_decoder_end();
         if (token >= 0) return token;
 
         /* full_step returned -1 (shared KV cache not available).

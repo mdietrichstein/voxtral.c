@@ -34,6 +34,9 @@ ifeq ($(UNAME_M),arm64)
 endif
 endif
 	@echo ""
+ifeq ($(UNAME_S),Linux)
+	@echo "  make vulkan   - Linux with Vulkan GPU acceleration"
+endif
 	@echo "Other targets:"
 	@echo "  make test     - Run regression tests (slow, needs fast GPU)"
 	@echo "  make clean    - Remove build artifacts"
@@ -59,11 +62,40 @@ blas: clean $(TARGET)
 	@echo "Built with BLAS backend"
 
 # =============================================================================
+# Backend: vulkan (Linux Vulkan GPU)
+# =============================================================================
+ifeq ($(UNAME_S),Linux)
+VULKAN_CFLAGS = $(CFLAGS_BASE) -Wno-missing-field-initializers -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -DUSE_GPU -I/usr/include/openblas
+VULKAN_LDFLAGS = $(LDFLAGS) -lopenblas -lvulkan
+
+vulkan: clean voxtral_shaders_vk_spv.h vulkan-build
+	@echo ""
+	@echo "Built with Vulkan backend (GPU acceleration)"
+
+voxtral_shaders_vk_spv.h: $(wildcard shaders/*.comp)
+	./compile_shaders.sh
+
+vulkan-build: $(SRCS:.c=.vulkan.o) voxtral_vulkan.vulkan.o main.vulkan.o
+	$(CC) $(VULKAN_CFLAGS) -o $(TARGET) $^ $(VULKAN_LDFLAGS)
+
+%.vulkan.o: %.c voxtral.h voxtral_kernels.h
+	$(CC) $(VULKAN_CFLAGS) -c -o $@ $<
+
+voxtral_vulkan.vulkan.o: voxtral_vulkan.c voxtral_vulkan.h voxtral_shaders_vk_spv.h voxtral.h
+	$(CC) $(VULKAN_CFLAGS) -c -o $@ $<
+
+else
+vulkan:
+	@echo "Error: Vulkan backend currently supports Linux only"
+	@exit 1
+endif
+
+# =============================================================================
 # Backend: mps (Apple Silicon Metal GPU)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
-MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
+MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DUSE_GPU -DACCELERATE_NEW_LAPACK
 MPS_OBJCFLAGS = $(MPS_CFLAGS) -fobjc-arc
 MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation -framework AudioToolbox -framework CoreFoundation
 
@@ -126,7 +158,7 @@ test:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	rm -f $(OBJS) *.mps.o *.vulkan.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
 	rm -f voxtral_shaders_source.h
 
 info:
@@ -141,6 +173,7 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+	@echo "  vulkan  - Vulkan GPU (requires vulkan-loader-devel, glslc)"
 endif
 
 # =============================================================================

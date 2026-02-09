@@ -1,0 +1,48 @@
+/*
+ * RMSNorm: out[row,i] = x[row,i] * rsqrt(mean(x[row]^2) + eps) * weight[i]
+ * One workgroup per row. x: [seq, hidden], weight: [hidden].
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufX { float x[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { float weight[]; };
+layout(set = 0, binding = 2) writeonly buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    int hidden;
+    float eps;
+};
+
+shared float shared_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint base = row * hidden;
+
+    /* Sum of squares */
+    float local_sum = 0.0;
+    for (int i = int(tid); i < hidden; i += int(threads)) {
+        float val = x[base + i];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    barrier();
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        barrier();
+    }
+
+    float rms_inv = inversesqrt(shared_sum[0] / float(hidden) + eps);
+
+    for (int i = int(tid); i < hidden; i += int(threads)) {
+        out_data[base + i] = x[base + i] * rms_inv * weight[i];
+    }
+}

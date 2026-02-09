@@ -15,8 +15,11 @@
 #include "voxtral.h"
 #include "voxtral_kernels.h"
 #include "voxtral_safetensors.h"
-#ifdef USE_METAL
-#include "voxtral_metal.h"
+#ifdef USE_GPU
+#include "voxtral_gpu.h"
+#endif
+#ifdef USE_VULKAN
+
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,9 +210,9 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
         vox_rms_norm(x_norm, x, l->attention_norm, seq_len, dim, VOX_ENC_NORM_EPS);
 
         /* Q, K, V projections (bf16 weights, f32 biases) */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_qkv_bf16(seq_len, dim, x_norm,
+#ifdef USE_GPU
+        if (vox_gpu_available()) {
+            vox_gpu_fused_qkv_bf16(seq_len, dim, x_norm,
                                       l->wq_weight_bf16, qkv_dim,
                                       l->wk_weight_bf16, qkv_dim,
                                       l->wv_weight_bf16, qkv_dim,
@@ -226,7 +229,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
             vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, seq_len, dim, qkv_dim);
             vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, qkv_dim);
             vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, seq_len, dim, qkv_dim);
-#ifdef USE_METAL
+#ifdef USE_GPU
         }
 #endif
 
@@ -236,9 +239,9 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
         /* Causal attention with sliding window */
         float scale = 1.0f / sqrtf((float)head_dim);
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_encoder_attention(attn_out, q, k, v,
+#ifdef USE_GPU
+        if (vox_gpu_available()) {
+            vox_gpu_encoder_attention(attn_out, q, k, v,
                                          seq_len, seq_len, n_heads, VOX_ENC_KV_HEADS,
                                          head_dim, scale, VOX_ENC_WINDOW, 0);
         } else {
@@ -246,14 +249,14 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
             vox_causal_attention(attn_out, q, k, v,
                                  seq_len, seq_len, n_heads, VOX_ENC_KV_HEADS,
                                  head_dim, scale, VOX_ENC_WINDOW, 0);
-#ifdef USE_METAL
+#ifdef USE_GPU
         }
 #endif
 
         /* Output projection + residual */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_sgemm_bf16(seq_len, dim, qkv_dim, attn_out,
+#ifdef USE_GPU
+        if (vox_gpu_available()) {
+            vox_gpu_sgemm_bf16(seq_len, dim, qkv_dim, attn_out,
                                    l->wo_weight_bf16, proj_out);
             /* Add wo bias on CPU */
             for (int s = 0; s < seq_len; s++)
@@ -262,7 +265,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
         } else {
 #endif
             vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, seq_len, qkv_dim, dim);
-#ifdef USE_METAL
+#ifdef USE_GPU
         }
 #endif
         vox_add_inplace(x, proj_out, seq_len * dim);
@@ -271,9 +274,9 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
         vox_rms_norm(x_norm, x, l->ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS);
 
         /* SwiGLU: gate = silu(w1(x)), up = w3(x), ffn = w2(gate * up) + bias */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_ffn_bf16(seq_len, dim, hidden, x_norm,
+#ifdef USE_GPU
+        if (vox_gpu_available()) {
+            vox_gpu_fused_ffn_bf16(seq_len, dim, hidden, x_norm,
                                       l->w1_weight_bf16, l->w3_weight_bf16,
                                       l->w2_weight_bf16, ffn_out);
             /* Add w2 bias on CPU */
@@ -287,7 +290,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
             vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
             vox_mul_inplace(gate, up, seq_len * hidden);
             vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, seq_len, hidden, dim);
-#ifdef USE_METAL
+#ifdef USE_GPU
         }
 #endif
 
@@ -330,10 +333,10 @@ int vox_encoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_pos) {
 
     size_t total = (size_t)VOX_ENC_LAYERS * max_pos * ENC_KV_DIM * sizeof(float);
 
-#ifdef USE_METAL
-    if (vox_metal_available()) {
-        ctx->enc_kv_cache_k = (float *)vox_metal_shared_alloc(total);
-        ctx->enc_kv_cache_v = (float *)vox_metal_shared_alloc(total);
+#ifdef USE_GPU
+    if (vox_gpu_available()) {
+        ctx->enc_kv_cache_k = (float *)vox_gpu_shared_alloc(total);
+        ctx->enc_kv_cache_v = (float *)vox_gpu_shared_alloc(total);
         ctx->enc_kv_cache_is_shared = 1;
     } else
 #endif
@@ -505,9 +508,9 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
     vox_compute_rope_freqs(rope_freqs, positions, new_len, head_dim, VOX_ROPE_THETA);
 
     /* GPU monolithic path: all 32 layers in one command buffer */
-#ifdef USE_METAL
-    if (vox_metal_available() && ctx->enc_kv_cache_is_shared) {
-        if (vox_metal_encoder_full_step(ctx, x, new_len, rope_freqs, cache_len) == 0) {
+#ifdef USE_GPU
+    if (vox_gpu_available() && ctx->enc_kv_cache_is_shared) {
+        if (vox_gpu_encoder_full_step(ctx, x, new_len, rope_freqs, cache_len) == 0) {
             ctx->enc_kv_cache_len = cache_len + new_len;
             *out_len = new_len;
             return x;
@@ -522,10 +525,15 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
         /* ---- Self-attention ---- */
         vox_rms_norm(x_norm, x, l->attention_norm, new_len, dim, VOX_ENC_NORM_EPS);
 
+        /* Debug norm output */
+        {
+        }
+
         /* Q, K, V projections on new positions only */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_qkv_bf16(new_len, dim, x_norm,
+        /* (Debug: print Q values after projection for layer 0) */
+#ifdef USE_GPU
+        if (vox_gpu_available()) {
+            vox_gpu_fused_qkv_bf16(new_len, dim, x_norm,
                                       l->wq_weight_bf16, qkv_dim,
                                       l->wk_weight_bf16, qkv_dim,
                                       l->wv_weight_bf16, qkv_dim,
@@ -542,9 +550,12 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, new_len, dim, qkv_dim);
             vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, new_len, dim, qkv_dim);
             vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, new_len, dim, qkv_dim);
-#ifdef USE_METAL
+#ifdef USE_GPU
         }
 #endif
+
+        {
+        }
 
         /* Apply RoPE to Q and K */
         vox_apply_rope(q, rope_freqs, new_len, n_heads, head_dim);
@@ -564,9 +575,9 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
         float *full_v = enc_kv_cache_v_at(ctx, layer, 0);
         float scale = 1.0f / sqrtf((float)head_dim);
 
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_encoder_attention(attn_out, q, full_k, full_v,
+#ifdef USE_GPU
+        if (vox_gpu_available()) {
+            vox_gpu_encoder_attention(attn_out, q, full_k, full_v,
                                          new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
                                          head_dim, scale, VOX_ENC_WINDOW, cache_len);
         } else {
@@ -574,14 +585,17 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             vox_causal_attention(attn_out, q, full_k, full_v,
                                  new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
                                  head_dim, scale, VOX_ENC_WINDOW, cache_len);
-#ifdef USE_METAL
+#ifdef USE_GPU
         }
 #endif
 
+        {
+        }
+
         /* Output projection + residual */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_sgemm_bf16(new_len, dim, qkv_dim, attn_out,
+#ifdef USE_GPU
+        if (vox_gpu_available()) {
+            vox_gpu_sgemm_bf16(new_len, dim, qkv_dim, attn_out,
                                    l->wo_weight_bf16, proj_out);
             /* Add wo bias on CPU */
             for (int s = 0; s < new_len; s++)
@@ -590,17 +604,20 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
         } else {
 #endif
             vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
-#ifdef USE_METAL
+#ifdef USE_GPU
         }
 #endif
         vox_add_inplace(x, proj_out, new_len * dim);
 
+        {
+        }
+
         /* ---- FFN ---- */
         vox_rms_norm(x_norm, x, l->ffn_norm, new_len, dim, VOX_ENC_NORM_EPS);
 
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_ffn_bf16(new_len, dim, hidden, x_norm,
+#ifdef USE_GPU
+        if (vox_gpu_available()) {
+            vox_gpu_fused_ffn_bf16(new_len, dim, hidden, x_norm,
                                       l->w1_weight_bf16, l->w3_weight_bf16,
                                       l->w2_weight_bf16, ffn_out);
             /* Add w2 bias on CPU */
@@ -610,16 +627,27 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
         } else {
 #endif
             vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, new_len, dim, hidden);
+            {
+            }
             vox_silu(gate, new_len * hidden);
             vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, new_len, dim, hidden);
             vox_mul_inplace(gate, up, new_len * hidden);
+            {
+            }
             vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, new_len, hidden, dim);
-#ifdef USE_METAL
+#ifdef USE_GPU
         }
 #endif
 
+        {
+        }
+
         /* Residual */
         vox_add_inplace(x, ffn_out, new_len * dim);
+
+        /* Debug: per-layer x output */
+        {
+        }
 
         if (vox_verbose >= 2 && ((layer + 1) % 8 == 0 || layer == VOX_ENC_LAYERS - 1))
             fprintf(stderr, "  Encoder inc layer %d/%d\n", layer + 1, VOX_ENC_LAYERS);

@@ -1,0 +1,129 @@
+/*
+ * Tiled matrix multiplication: C[M,N] = A[M,K] @ B^T[N,K]
+ * A is f32, B is bf16 (stored as uint16), C is f32.
+ *
+ * Workgroup tile: BM×BN = 64×64 output elements.
+ * Thread tile: TM×TN = 4×4 = 16 output elements per thread.
+ * K-tile: BK=16, with shared memory for A and B.
+ * 256 threads (16×16 grid), each computes a 4×4 sub-tile.
+ *
+ * Grid: ceil(M/64) * ceil(N/64) workgroups.
+ */
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#define BM 64
+#define BN 64
+#define BK 16
+#define TM 4
+#define TN 4
+#define THREADS 256
+
+layout(local_size_x = THREADS) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { uint16_t B[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float C[]; };
+
+layout(push_constant) uniform Params {
+    int M, N, K;
+};
+
+float bf16(uint16_t v) {
+    return uintBitsToFloat(uint(v) << 16);
+}
+
+shared float sA[BM * (BK + 1)];
+shared float sB[BN * (BK + 1)];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
+
+    int tiles_n = (N + BN - 1) / BN;
+    int tile_r = int(wg) / tiles_n;
+    int tile_c = int(wg) % tiles_n;
+    int row_base = tile_r * BM;
+    int col_base = tile_c * BN;
+
+    int tr = int(tid) / 16;
+    int tc = int(tid) % 16;
+
+    float acc00 = 0.0, acc01 = 0.0, acc02 = 0.0, acc03 = 0.0;
+    float acc10 = 0.0, acc11 = 0.0, acc12 = 0.0, acc13 = 0.0;
+    float acc20 = 0.0, acc21 = 0.0, acc22 = 0.0, acc23 = 0.0;
+    float acc30 = 0.0, acc31 = 0.0, acc32 = 0.0, acc33 = 0.0;
+
+    int sA_stride = BK + 1;
+    int sB_stride = BK + 1;
+
+    for (int kk = 0; kk < K; kk += BK) {
+        for (int i = int(tid); i < BM * BK; i += THREADS) {
+            int r = i / BK;
+            int c = i % BK;
+            int gr = row_base + r;
+            int gc = kk + c;
+            sA[r * sA_stride + c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0;
+        }
+        for (int i = int(tid); i < BN * BK; i += THREADS) {
+            int r = i / BK;
+            int c = i % BK;
+            int gr = col_base + r;
+            int gc = kk + c;
+            sB[r * sB_stride + c] = (gr < N && gc < K) ? bf16(B[gr * K + gc]) : 0.0;
+        }
+
+        barrier();
+
+        int a_base = tr * TM;
+        int b_base = tc * TN;
+
+        for (int k = 0; k < BK; k++) {
+            float a0 = sA[(a_base + 0) * sA_stride + k];
+            float a1 = sA[(a_base + 1) * sA_stride + k];
+            float a2 = sA[(a_base + 2) * sA_stride + k];
+            float a3 = sA[(a_base + 3) * sA_stride + k];
+
+            float b0 = sB[(b_base + 0) * sB_stride + k];
+            float b1 = sB[(b_base + 1) * sB_stride + k];
+            float b2 = sB[(b_base + 2) * sB_stride + k];
+            float b3 = sB[(b_base + 3) * sB_stride + k];
+
+            acc00 += a0 * b0; acc01 += a0 * b1; acc02 += a0 * b2; acc03 += a0 * b3;
+            acc10 += a1 * b0; acc11 += a1 * b1; acc12 += a1 * b2; acc13 += a1 * b3;
+            acc20 += a2 * b0; acc21 += a2 * b1; acc22 += a2 * b2; acc23 += a2 * b3;
+            acc30 += a3 * b0; acc31 += a3 * b1; acc32 += a3 * b2; acc33 += a3 * b3;
+        }
+
+        barrier();
+    }
+
+    int gr0 = row_base + tr * TM;
+    int gc0 = col_base + tc * TN;
+
+    if (gr0 + 0 < M) {
+        if (gc0 + 0 < N) C[(gr0 + 0) * N + gc0 + 0] = acc00;
+        if (gc0 + 1 < N) C[(gr0 + 0) * N + gc0 + 1] = acc01;
+        if (gc0 + 2 < N) C[(gr0 + 0) * N + gc0 + 2] = acc02;
+        if (gc0 + 3 < N) C[(gr0 + 0) * N + gc0 + 3] = acc03;
+    }
+    if (gr0 + 1 < M) {
+        if (gc0 + 0 < N) C[(gr0 + 1) * N + gc0 + 0] = acc10;
+        if (gc0 + 1 < N) C[(gr0 + 1) * N + gc0 + 1] = acc11;
+        if (gc0 + 2 < N) C[(gr0 + 1) * N + gc0 + 2] = acc12;
+        if (gc0 + 3 < N) C[(gr0 + 1) * N + gc0 + 3] = acc13;
+    }
+    if (gr0 + 2 < M) {
+        if (gc0 + 0 < N) C[(gr0 + 2) * N + gc0 + 0] = acc20;
+        if (gc0 + 1 < N) C[(gr0 + 2) * N + gc0 + 1] = acc21;
+        if (gc0 + 2 < N) C[(gr0 + 2) * N + gc0 + 2] = acc22;
+        if (gc0 + 3 < N) C[(gr0 + 2) * N + gc0 + 3] = acc23;
+    }
+    if (gr0 + 3 < M) {
+        if (gc0 + 0 < N) C[(gr0 + 3) * N + gc0 + 0] = acc30;
+        if (gc0 + 1 < N) C[(gr0 + 3) * N + gc0 + 1] = acc31;
+        if (gc0 + 2 < N) C[(gr0 + 3) * N + gc0 + 2] = acc32;
+        if (gc0 + 3 < N) C[(gr0 + 3) * N + gc0 + 3] = acc33;
+    }
+}
