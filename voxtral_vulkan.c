@@ -180,7 +180,8 @@ static int g_is_integrated = 0;
 /* Create a host-visible buffer and memcpy data directly (zero-copy for iGPU).
  * For discrete GPUs we'd want staging, but for integrated this avoids 2x memory. */
 static int create_device_buffer_with_data(const void *data, size_t size,
-                                           VkBuffer *buf, VkDeviceMemory *mem) {
+                                           VkBuffer *buf, VkDeviceMemory *mem,
+                                           void **out_mapped) {
     /* For integrated GPUs: use host-visible + device-local (zero-copy) */
     VkMemoryPropertyFlags flags =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -204,10 +205,16 @@ static int create_device_buffer_with_data(const void *data, size_t size,
         }
     }
 
-    void *mapped;
+    void *mapped = NULL;
     vkMapMemory(g_device, *mem, 0, size, 0, &mapped);
     memcpy(mapped, data, size);
-    vkUnmapMemory(g_device, *mem);
+
+    /* Keep weights persistently mapped to avoid map/unmap overhead. */
+    if (out_mapped) {
+        *out_mapped = mapped;
+    } else {
+        vkUnmapMemory(g_device, *mem);
+    }
 
     return 0;
 }
@@ -233,7 +240,7 @@ static buf_cache_entry_t *get_cached_buffer(const void *cpu_ptr, size_t size) {
     e->cpu_ptr = cpu_ptr;
     e->size = size;
     e->mapped = NULL;
-    if (create_device_buffer_with_data(cpu_ptr, size, &e->buffer, &e->memory) < 0) {
+    if (create_device_buffer_with_data(cpu_ptr, size, &e->buffer, &e->memory, &e->mapped) < 0) {
         pthread_mutex_unlock(&g_buf_cache_mutex);
         return NULL;
     }
@@ -287,7 +294,7 @@ static VkBuffer get_merged_buffer_2(const uint16_t *a, size_t a_bytes,
     e->key1 = a;
     e->key2 = b;
     e->size = total;
-    if (create_device_buffer_with_data(tmp, total, &e->buffer, &e->memory) < 0) {
+    if (create_device_buffer_with_data(tmp, total, &e->buffer, &e->memory, NULL) < 0) {
         free(tmp);
         return VK_NULL_HANDLE;
     }
@@ -315,7 +322,7 @@ static VkBuffer get_merged_buffer_3(const uint16_t *a, size_t a_bytes,
     e->key1 = a;
     e->key2 = b;
     e->size = total;
-    if (create_device_buffer_with_data(tmp, total, &e->buffer, &e->memory) < 0) {
+    if (create_device_buffer_with_data(tmp, total, &e->buffer, &e->memory, NULL) < 0) {
         free(tmp);
         return VK_NULL_HANDLE;
     }
