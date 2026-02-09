@@ -171,6 +171,7 @@ int main(int argc, char **argv) {
     vox_verbose = verbosity;
     vox_verbose_audio = (verbosity >= 2) ? 1 : 0;
 
+    vox_kernels_init();
 #ifdef USE_GPU
     vox_gpu_init();
 #endif
@@ -388,5 +389,6 @@ int main(int argc, char **argv) {
 #ifdef USE_GPU
     vox_gpu_shutdown();
 #endif
+    vox_kernels_shutdown();
     return 0;
 }

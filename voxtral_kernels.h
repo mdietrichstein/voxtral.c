@@ -158,6 +158,18 @@ void vox_compute_rope_freqs(float *freqs, const int *pos, int seq, int dim, floa
  */
 void vox_apply_rope(float *x, const float *freqs, int seq, int heads, int head_dim);
 
+/* ========================================================================
+ * Thread Pool (for multi-threaded bf16 matvec on Linux)
+ * ======================================================================== */
+
+/*
+ * Initialize/shutdown the kernel thread pool.
+ * Call vox_kernels_init() before any inference, vox_kernels_shutdown() at exit.
+ * Safe to call multiple times or not at all (falls back to single-threaded).
+ */
+void vox_kernels_init(void);
+void vox_kernels_shutdown(void);
+
 /* Global verbose flag */
 extern int vox_verbose;
 

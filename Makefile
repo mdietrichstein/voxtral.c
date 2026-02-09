@@ -53,8 +53,17 @@ SRCS += voxtral_mic_macos.c
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate -framework AudioToolbox -framework CoreFoundation
 else
-blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-blas: LDFLAGS += -lopenblas
+# Use local AVX-512 OpenBLAS if available, else system OpenBLAS
+LOCAL_BLAS = $(CURDIR)/openblas-local
+ifneq ($(wildcard $(LOCAL_BLAS)/lib/libopenblas.so),)
+OPENBLAS_INC = -I$(LOCAL_BLAS)/include
+OPENBLAS_LIB = -L$(LOCAL_BLAS)/lib -lopenblas -Wl,-rpath,$(LOCAL_BLAS)/lib
+else
+OPENBLAS_INC = -I/usr/include/openblas
+OPENBLAS_LIB = -lopenblas
+endif
+blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS $(OPENBLAS_INC)
+blas: LDFLAGS += $(OPENBLAS_LIB) -lpthread
 SRCS += voxtral_mic_macos.c
 endif
 blas: clean $(TARGET)
@@ -65,8 +74,8 @@ blas: clean $(TARGET)
 # Backend: vulkan (Linux Vulkan GPU)
 # =============================================================================
 ifeq ($(UNAME_S),Linux)
-VULKAN_CFLAGS = $(CFLAGS_BASE) -Wno-missing-field-initializers -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -DUSE_GPU -I/usr/include/openblas
-VULKAN_LDFLAGS = $(LDFLAGS) -lopenblas -lvulkan
+VULKAN_CFLAGS = $(CFLAGS_BASE) -Wno-missing-field-initializers -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -DUSE_GPU $(OPENBLAS_INC)
+VULKAN_LDFLAGS = $(LDFLAGS) $(OPENBLAS_LIB) -lvulkan -lpthread
 
 vulkan: clean voxtral_shaders_vk_spv.h vulkan-build
 	@echo ""

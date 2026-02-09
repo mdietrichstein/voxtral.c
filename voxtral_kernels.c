@@ -24,6 +24,85 @@
 #define MIN_GPU_ELEMENTS (512 * 512)
 
 /* ========================================================================
+ * Thread Pool for BF16 Matvec
+ *
+ * Barrier-based thread pool with persistent worker threads.
+ * Workers wait on start_barrier, compute their chunk, then wait on done_barrier.
+ * The main thread dispatches work by filling the work array and hitting both barriers.
+ * ======================================================================== */
+
+#if defined(__linux__)
+#include <pthread.h>
+
+#define MATVEC_MAX_THREADS 6
+/* Minimum output rows to justify threading overhead */
+#define MATVEC_THREAD_THRESHOLD 512
+
+typedef struct {
+    float *y;
+    const float *x;
+    const uint16_t *W_bf16;
+    const float *bias;
+    int in_dim;
+    int out_start;
+    int out_end;
+} matvec_work_t;
+
+static pthread_t        mv_threads[MATVEC_MAX_THREADS];
+static matvec_work_t    mv_work[MATVEC_MAX_THREADS];
+static pthread_barrier_t mv_start_barrier;
+static pthread_barrier_t mv_done_barrier;
+static int              mv_n_threads = 0;
+static volatile int     mv_shutdown = 0;
+
+/* Forward declaration: the single-threaded bf16 matvec for a row range */
+static void bf16_matvec_range(float *y, const float *x, const uint16_t *W_bf16,
+                              const float *bias, int in_dim, int out_start, int out_end);
+
+static void *mv_worker(void *arg) {
+    int id = (int)(intptr_t)arg;
+    for (;;) {
+        pthread_barrier_wait(&mv_start_barrier);
+        if (mv_shutdown) break;
+        matvec_work_t *w = &mv_work[id];
+        bf16_matvec_range(w->y, w->x, w->W_bf16, w->bias,
+                          w->in_dim, w->out_start, w->out_end);
+        pthread_barrier_wait(&mv_done_barrier);
+    }
+    return NULL;
+}
+
+void vox_kernels_init(void) {
+    if (mv_n_threads > 0) return; /* already initialized */
+    mv_n_threads = 3; /* sweet spot for DDR5 dual-channel bandwidth */
+    mv_shutdown = 0;
+    pthread_barrier_init(&mv_start_barrier, NULL, mv_n_threads + 1);
+    pthread_barrier_init(&mv_done_barrier, NULL, mv_n_threads + 1);
+    for (int t = 0; t < mv_n_threads; t++) {
+        pthread_create(&mv_threads[t], NULL, mv_worker, (void *)(intptr_t)t);
+    }
+}
+
+void vox_kernels_shutdown(void) {
+    if (mv_n_threads == 0) return;
+    mv_shutdown = 1;
+    pthread_barrier_wait(&mv_start_barrier); /* release workers to see shutdown */
+    for (int t = 0; t < mv_n_threads; t++) {
+        pthread_join(mv_threads[t], NULL);
+    }
+    pthread_barrier_destroy(&mv_start_barrier);
+    pthread_barrier_destroy(&mv_done_barrier);
+    mv_n_threads = 0;
+}
+
+#else /* non-Linux: no thread pool */
+
+void vox_kernels_init(void) {}
+void vox_kernels_shutdown(void) {}
+
+#endif /* __linux__ */
+
+/* ========================================================================
  * Basic Element-wise Operations
  * ======================================================================== */
 
@@ -146,14 +225,23 @@ static float *bf16_get_scratch(size_t n) {
  * Reads BF16 weights directly and converts in-register, avoiding the
  * double-streaming penalty of "convert full matrix then BLAS".
  * This is the critical fast path for single-token decoder generation.
+ *
+ * On x86-64, the scalar loop is auto-vectorized by GCC to AVX-512
+ * (vpmovzxwd + vpslld + vfmadd231ps on zmm registers). This matches or
+ * beats hand-written intrinsics, so we keep the code simple.
+ *
+ * On ARM, explicit NEON intrinsics are used.
  */
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
 
-static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
-                               const float *bias, int in_dim, int out_dim) {
-    for (int o = 0; o < out_dim; o++) {
+/* Compute output rows [out_start, out_end) — the core inner loop.
+ * Used directly for single-threaded, and by thread pool workers. */
+static void bf16_matvec_range(float *y, const float *x, const uint16_t *W_bf16,
+                              const float *bias, int in_dim,
+                              int out_start, int out_end) {
+    for (int o = out_start; o < out_end; o++) {
         const uint16_t *w_row = W_bf16 + (size_t)o * in_dim;
         float sum = bias ? bias[o] : 0.0f;
         int k = 0;
@@ -182,7 +270,7 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
         sum += vaddvq_f32(vaddq_f32(acc0, acc1));
 #endif
 
-        /* Scalar tail */
+        /* Scalar tail (on x86-64: entire loop, auto-vectorized to AVX-512) */
         for (; k < in_dim; k++) {
             uint32_t f32_bits = ((uint32_t)w_row[k]) << 16;
             float w_val;
@@ -192,6 +280,29 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
 
         y[o] = sum;
     }
+}
+
+static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
+                              const float *bias, int in_dim, int out_dim) {
+#if defined(__linux__)
+    /* Use thread pool if available and the matmul is large enough */
+    if (mv_n_threads > 0 && out_dim >= MATVEC_THREAD_THRESHOLD) {
+        int chunk = out_dim / mv_n_threads;
+        for (int t = 0; t < mv_n_threads; t++) {
+            mv_work[t].y = y;
+            mv_work[t].x = x;
+            mv_work[t].W_bf16 = W_bf16;
+            mv_work[t].bias = bias;
+            mv_work[t].in_dim = in_dim;
+            mv_work[t].out_start = t * chunk;
+            mv_work[t].out_end = (t == mv_n_threads - 1) ? out_dim : (t + 1) * chunk;
+        }
+        pthread_barrier_wait(&mv_start_barrier); /* release workers */
+        pthread_barrier_wait(&mv_done_barrier);  /* wait for completion */
+        return;
+    }
+#endif
+    bf16_matvec_range(y, x, W_bf16, bias, in_dim, 0, out_dim);
 }
 
 void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,

@@ -4,3 +4,5 @@ voxtral-model/
 pyenv*/
 misc/
 *.o
+openblas-zen4/
+openblas-local/
