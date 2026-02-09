@@ -47,6 +47,7 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
 }
 
 static int g_dec_ffn_int8 = 0;
+static int g_dec_attn_int8 = 0;
 
 static void dec_int8_init_once(void) {
     static int inited = 0;
@@ -54,6 +55,8 @@ static void dec_int8_init_once(void) {
     inited = 1;
     const char *e = getenv("VOX_DEC_FFN_INT8");
     g_dec_ffn_int8 = (e && e[0] && strcmp(e, "0") != 0);
+    const char *a = getenv("VOX_DEC_ATTN_INT8");
+    g_dec_attn_int8 = (a && a[0] && strcmp(a, "0") != 0);
 }
 
 static void quantize_bf16_row_to_i8(const uint16_t *w_bf16, int in_dim,
@@ -112,6 +115,45 @@ static int decoder_quantize_ffn_int8_layer(vox_dec_layer_t *l) {
     return 0;
 }
 
+static int decoder_quantize_attn_int8_layer(vox_dec_layer_t *l) {
+    int dim = VOX_DEC_DIM;
+    int q_dim = VOX_DEC_HEADS * VOX_DEC_HEAD_DIM;      /* 4096 */
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;  /* 1024 */
+
+    l->wq_i8 = (int8_t *)malloc((size_t)q_dim * dim);
+    l->wq_scale = (float *)malloc((size_t)q_dim * sizeof(float));
+    l->wk_i8 = (int8_t *)malloc((size_t)kv_dim * dim);
+    l->wk_scale = (float *)malloc((size_t)kv_dim * sizeof(float));
+    l->wv_i8 = (int8_t *)malloc((size_t)kv_dim * dim);
+    l->wv_scale = (float *)malloc((size_t)kv_dim * sizeof(float));
+    /* wo is [dim, q_dim] (row-major: dim rows, q_dim cols) */
+    l->wo_i8 = (int8_t *)malloc((size_t)dim * q_dim);
+    l->wo_scale = (float *)malloc((size_t)dim * sizeof(float));
+
+    if (!l->wq_i8 || !l->wq_scale || !l->wk_i8 || !l->wk_scale ||
+        !l->wv_i8 || !l->wv_scale || !l->wo_i8 || !l->wo_scale)
+        return -1;
+
+    for (int o = 0; o < q_dim; o++) {
+        const uint16_t *row = l->wq_weight_bf16 + (size_t)o * dim;
+        quantize_bf16_row_to_i8(row, dim, l->wq_i8 + (size_t)o * dim, &l->wq_scale[o]);
+    }
+    for (int o = 0; o < kv_dim; o++) {
+        const uint16_t *row = l->wk_weight_bf16 + (size_t)o * dim;
+        quantize_bf16_row_to_i8(row, dim, l->wk_i8 + (size_t)o * dim, &l->wk_scale[o]);
+    }
+    for (int o = 0; o < kv_dim; o++) {
+        const uint16_t *row = l->wv_weight_bf16 + (size_t)o * dim;
+        quantize_bf16_row_to_i8(row, dim, l->wv_i8 + (size_t)o * dim, &l->wv_scale[o]);
+    }
+    for (int o = 0; o < dim; o++) {
+        const uint16_t *row = l->wo_weight_bf16 + (size_t)o * q_dim;
+        quantize_bf16_row_to_i8(row, q_dim, l->wo_i8 + (size_t)o * q_dim, &l->wo_scale[o]);
+    }
+
+    return 0;
+}
+
 int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
     dec_int8_init_once();
     char name[512];
@@ -163,6 +205,12 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
             return -1;
         }
 
+        if (g_dec_attn_int8) {
+            if (decoder_quantize_attn_int8_layer(l) != 0) {
+                fprintf(stderr, "decoder: ATTN int8 quantization failed (layer %d)\n", i);
+                return -1;
+            }
+        }
         if (g_dec_ffn_int8) {
             if (decoder_quantize_ffn_int8_layer(l) != 0) {
                 fprintf(stderr, "decoder: FFN int8 quantization failed (layer %d)\n", i);
@@ -520,9 +568,15 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         vox_dec_layer_t *l = &dec->layers[layer];
 
         vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
-        vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
-        vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
-        vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
+        if (g_dec_attn_int8 && l->wq_i8 && l->wk_i8 && l->wv_i8) {
+            vox_linear_nobias_i8(q, x_norm, l->wq_i8, l->wq_scale, dim, q_dim);
+            vox_linear_nobias_i8(k, x_norm, l->wk_i8, l->wk_scale, dim, kv_dim);
+            vox_linear_nobias_i8(v, x_norm, l->wv_i8, l->wv_scale, dim, kv_dim);
+        } else {
+            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
+            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
+            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
+        }
 
         vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
         vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
@@ -538,7 +592,11 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
                              1, total_seq, n_heads, n_kv_heads,
                              head_dim, scale, VOX_DEC_WINDOW, pos);
 
-        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+        if (g_dec_attn_int8 && l->wo_i8) {
+            vox_linear_nobias_i8(proj_out, attn_out, l->wo_i8, l->wo_scale, q_dim, dim);
+        } else {
+            vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+        }
         vox_add_inplace(x, proj_out, dim);
 
         vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);

@@ -114,6 +114,16 @@ typedef struct {
     uint16_t *wo_weight_bf16;/* [3072, 4096] - bf16 mmap direct */
     float *attention_norm;   /* [3072] */
 
+    /* Optional attention int8 weight-only quantization (allocated at load time if enabled) */
+    int8_t *wq_i8;           /* [4096, 3072] */
+    float *wq_scale;         /* [4096] */
+    int8_t *wk_i8;           /* [1024, 3072] */
+    float *wk_scale;         /* [1024] */
+    int8_t *wv_i8;           /* [1024, 3072] */
+    float *wv_scale;         /* [1024] */
+    int8_t *wo_i8;           /* [3072, 4096] */
+    float *wo_scale;         /* [3072] */
+
     /* Feed-forward */
     float *w1_weight;        /* [9216, 3072] gate - f32 (NULL if bf16) */
     uint16_t *w1_weight_bf16;/* [9216, 3072] - bf16 mmap direct */
