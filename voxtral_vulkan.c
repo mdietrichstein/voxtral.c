@@ -2121,10 +2121,23 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_idx++); /* after_ffn */
         if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_idx++); /* layer_end */
 
-        /* Submit every layers_per_submit layers or at the last layer */
+        /* Submit every layers_per_submit layers or at the last layer.
+         * Optionally avoid waiting on intermediate submits:
+         *   VOX_VK_NO_WAIT_BATCH=1 => submit batches with submit_and_continue(),
+         *   only submit_and_wait() on the final batch.
+         */
         if ((layer + 1) % layers_per_submit == 0 || layer == VOX_ENC_LAYERS - 1) {
-            if (g_vk_gpu_timing && g_ts_pool && layer == VOX_ENC_LAYERS - 1) cmd_ts(cmd, ts_idx++); /* total_end */
-            submit_and_wait(cmd);
+            int is_last = (layer == VOX_ENC_LAYERS - 1);
+            int no_wait = 0;
+            const char *nw = getenv("VOX_VK_NO_WAIT_BATCH");
+            if (nw && nw[0] && strcmp(nw, "0") != 0) no_wait = 1;
+
+            if (g_vk_gpu_timing && g_ts_pool && is_last) cmd_ts(cmd, ts_idx++); /* total_end */
+
+            if (no_wait && !is_last)
+                submit_and_continue(cmd);
+            else
+                submit_and_wait(cmd);
         } else {
             cmd_barrier(cmd);
         }
