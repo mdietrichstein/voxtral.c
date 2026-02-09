@@ -206,7 +206,14 @@ static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
         d[i] = ((uint32_t)src[i]) << 16;
 }
 
-/* Reusable scratch buffer for bf16->f32 conversion (avoids malloc/free per call) */
+/* Convert f32 buffer to bf16 buffer (truncation, no rounding — matches weight format) */
+static void f32_to_bf16_buf(uint16_t *dst, const float *src, size_t n) {
+    const uint32_t *s = (const uint32_t *)(const void *)src;
+    for (size_t i = 0; i < n; i++)
+        dst[i] = (uint16_t)(s[i] >> 16);
+}
+
+/* Reusable scratch buffer for bf16->f32 weight conversion (avoids malloc/free per call) */
 static float *bf16_scratch = NULL;
 static size_t bf16_scratch_cap = 0;
 
@@ -217,6 +224,19 @@ static float *bf16_get_scratch(size_t n) {
         bf16_scratch_cap = bf16_scratch ? n : 0;
     }
     return bf16_scratch;
+}
+
+/* Reusable scratch buffer for f32->bf16 activation conversion */
+static uint16_t *bf16_act_scratch = NULL;
+static size_t bf16_act_scratch_cap = 0;
+
+static uint16_t *bf16_get_act_scratch(size_t n) {
+    if (n > bf16_act_scratch_cap) {
+        free(bf16_act_scratch);
+        bf16_act_scratch = (uint16_t *)malloc(n * sizeof(uint16_t));
+        bf16_act_scratch_cap = bf16_act_scratch ? n : 0;
+    }
+    return bf16_act_scratch;
 }
 
 /*
@@ -317,6 +337,22 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
         bf16_matvec_fused(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
     }
+#if defined(USE_OPENBLAS) && defined(BUILD_BFLOAT16)
+    /* Use sbgemm: convert small activation matrix f32→bf16, then native bf16 GEMM.
+     * This avoids converting the large weight matrix (50-100× more data). */
+    {
+        size_t act_n = (size_t)seq_len * in_dim;
+        uint16_t *x_bf16 = bf16_get_act_scratch(act_n);
+        if (x_bf16) {
+            f32_to_bf16_buf(x_bf16, x, act_n);
+            cblas_sbgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                         seq_len, out_dim, in_dim,
+                         1.0f, x_bf16, in_dim, W_bf16, in_dim,
+                         0.0f, y, out_dim);
+            return;
+        }
+    }
+#endif
     size_t n = (size_t)out_dim * in_dim;
     float *W_f32 = bf16_get_scratch(n);
     if (!W_f32) return;
@@ -343,6 +379,25 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
         bf16_matvec_fused(y, x, W_bf16, b, in_dim, out_dim);
         return;
     }
+#if defined(USE_OPENBLAS) && defined(BUILD_BFLOAT16)
+    {
+        size_t act_n = (size_t)seq_len * in_dim;
+        uint16_t *x_bf16 = bf16_get_act_scratch(act_n);
+        if (x_bf16) {
+            f32_to_bf16_buf(x_bf16, x, act_n);
+            cblas_sbgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                         seq_len, out_dim, in_dim,
+                         1.0f, x_bf16, in_dim, W_bf16, in_dim,
+                         0.0f, y, out_dim);
+            if (b != NULL) {
+                for (int s = 0; s < seq_len; s++)
+                    for (int o = 0; o < out_dim; o++)
+                        y[s * out_dim + o] += b[o];
+            }
+            return;
+        }
+    }
+#endif
     size_t n = (size_t)out_dim * in_dim;
     float *W_f32 = bf16_get_scratch(n);
     if (!W_f32) return;
@@ -355,7 +410,7 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
     /*
      * C[M,N] = A[M,K] @ B[N,K]^T
      * For M=1: use fused BF16 matvec (no intermediate buffer needed).
-     * For M>1: convert full matrix and use BLAS.
+     * For M>1: use sbgemm if available, else convert and use BLAS.
      */
 #ifdef USE_METAL
     if (vox_metal_available()) {
@@ -366,6 +421,16 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
     if (M == 1) {
         bf16_matvec_fused(C, A, B_bf16, NULL, K, N);
     } else {
+#if defined(USE_OPENBLAS) && defined(BUILD_BFLOAT16)
+        size_t act_n = (size_t)M * K;
+        uint16_t *A_bf16 = bf16_get_act_scratch(act_n);
+        if (A_bf16) {
+            f32_to_bf16_buf(A_bf16, A, act_n);
+            cblas_sbgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                         M, N, K, 1.0f, A_bf16, K, B_bf16, K, 0.0f, C, N);
+            return;
+        }
+#endif
         size_t n = (size_t)N * K;
         float *B_f32 = bf16_get_scratch(n);
         if (!B_f32) return;

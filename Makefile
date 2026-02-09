@@ -62,7 +62,11 @@ else
 OPENBLAS_INC = -I/usr/include/openblas
 OPENBLAS_LIB = -lopenblas
 endif
-blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS $(OPENBLAS_INC)
+OPENBLAS_HAS_BF16 := $(shell nm -D $(LOCAL_BLAS)/lib/libopenblas.so 2>/dev/null | grep -q cblas_sbgemm && echo 1)
+ifeq ($(OPENBLAS_HAS_BF16),1)
+OPENBLAS_BF16_FLAG = -DBUILD_BFLOAT16
+endif
+blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS $(OPENBLAS_INC) $(OPENBLAS_BF16_FLAG)
 blas: LDFLAGS += $(OPENBLAS_LIB) -lpthread
 SRCS += voxtral_mic_macos.c
 endif
@@ -74,7 +78,7 @@ blas: clean $(TARGET)
 # Backend: vulkan (Linux Vulkan GPU)
 # =============================================================================
 ifeq ($(UNAME_S),Linux)
-VULKAN_CFLAGS = $(CFLAGS_BASE) -Wno-missing-field-initializers -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -DUSE_GPU $(OPENBLAS_INC)
+VULKAN_CFLAGS = $(CFLAGS_BASE) -Wno-missing-field-initializers -DUSE_BLAS -DUSE_OPENBLAS -DUSE_VULKAN -DUSE_GPU $(OPENBLAS_INC) $(OPENBLAS_BF16_FLAG)
 VULKAN_LDFLAGS = $(LDFLAGS) $(OPENBLAS_LIB) -lvulkan -lpthread
 
 vulkan: clean voxtral_shaders_vk_spv.h vulkan-build
