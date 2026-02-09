@@ -1857,8 +1857,18 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
                     vox_vulkan_memory_used() / (1024.0 * 1024.0));
     }
 
-    /* Batch multiple layers per command buffer submit to reduce overhead */
-#define ENC_LAYERS_PER_SUBMIT 4
+    /* Batch multiple layers per command buffer submit to reduce overhead.
+     * Tunable via VOX_VK_LAYERS_PER_SUBMIT (default: 4).
+     */
+    int layers_per_submit = 4;
+    {
+        const char *e = getenv("VOX_VK_LAYERS_PER_SUBMIT");
+        if (e && e[0]) {
+            int v = atoi(e);
+            if (v >= 1 && v <= VOX_ENC_LAYERS) layers_per_submit = v;
+        }
+    }
+
     VkCommandBuffer cmd = VK_NULL_HANDLE;
 
     /* GPU timestamp indices */
@@ -1881,7 +1891,7 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
     }
 
     for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
-        if (layer % ENC_LAYERS_PER_SUBMIT == 0) {
+        if (layer % layers_per_submit == 0) {
             cmd = begin_cmd();
             if (g_vk_gpu_timing && g_ts_pool && layer == 0) cmd_ts(cmd, ts_idx++); /* total_begin */
         }
@@ -2111,8 +2121,8 @@ int vox_vulkan_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_idx++); /* after_ffn */
         if (g_vk_gpu_timing && g_ts_pool) cmd_ts(cmd, ts_idx++); /* layer_end */
 
-        /* Submit every ENC_LAYERS_PER_SUBMIT layers or at the last layer */
-        if ((layer + 1) % ENC_LAYERS_PER_SUBMIT == 0 || layer == VOX_ENC_LAYERS - 1) {
+        /* Submit every layers_per_submit layers or at the last layer */
+        if ((layer + 1) % layers_per_submit == 0 || layer == VOX_ENC_LAYERS - 1) {
             if (g_vk_gpu_timing && g_ts_pool && layer == VOX_ENC_LAYERS - 1) cmd_ts(cmd, ts_idx++); /* total_end */
             submit_and_wait(cmd);
         } else {
