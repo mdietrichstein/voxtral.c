@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <math.h>
+#include <sys/time.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
@@ -37,6 +38,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent      No status output (only transcription on stdout)\n");
+    fprintf(stderr, "  --bench-decode <N>  After transcription, run N extra decoder forward steps (microbench)\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -123,6 +125,7 @@ int main(int argc, char **argv) {
     int use_stdin = 0;
     int use_mic = 0;
     float interval = -1.0f; /* <0 means use default */
+    int bench_decode = 0;    /* if >0: run decoder-forward microbench after normal run */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -149,6 +152,12 @@ int main(int argc, char **argv) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
             verbosity = 0;
+        } else if (strcmp(argv[i], "--bench-decode") == 0 && i + 1 < argc) {
+            bench_decode = atoi(argv[++i]);
+            if (bench_decode < 1) {
+                fprintf(stderr, "Error: --bench-decode requires N>=1\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -383,6 +392,31 @@ int main(int argc, char **argv) {
     drain_tokens(s);
     fputs("\n", stdout);
     fflush(stdout);
+
+    if (bench_decode > 0) {
+        int dim = VOX_DEC_DIM;
+        float *embed = (float *)malloc((size_t)dim * sizeof(float));
+        float *logits = (float *)malloc((size_t)VOX_VOCAB_SIZE * sizeof(float));
+        if (embed && logits) {
+            /* Reuse last embedding as input (stable microbench, ignores token correctness).
+             * We don't have access to vox_stream internals here, so just fill with small values.
+             */
+            for (int j = 0; j < dim; j++) embed[j] = 0.01f;
+
+            struct timeval t0, t1;
+            gettimeofday(&t0, NULL);
+            for (int i = 0; i < bench_decode; i++) {
+                (void)vox_decoder_forward(ctx, embed, logits);
+            }
+            gettimeofday(&t1, NULL);
+            double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                        (t1.tv_usec - t0.tv_usec) / 1000.0;
+            fprintf(stderr, "Bench decode: %d forwards in %.0f ms (%.3f ms/step)\n",
+                    bench_decode, ms, ms / bench_decode);
+        }
+        free(embed);
+        free(logits);
+    }
 
     vox_stream_free(s);
     vox_free(ctx);

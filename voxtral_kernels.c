@@ -37,6 +37,7 @@
 #define MATVEC_MAX_THREADS 6
 /* Minimum output rows to justify threading overhead */
 #define MATVEC_THREAD_THRESHOLD 512
+#define MATVEC_I8_THREAD_THRESHOLD 256
 
 typedef enum {
     MV_KIND_BF16 = 0,
@@ -388,7 +389,7 @@ static void i8_matvec_fused(float *y, const float *x,
                             const int8_t *W_i8, const float *scale,
                             int in_dim, int out_dim) {
 #if defined(__linux__)
-    if (mv_n_threads > 0 && out_dim >= MATVEC_THREAD_THRESHOLD) {
+    if (mv_n_threads > 0 && out_dim >= MATVEC_I8_THREAD_THRESHOLD) {
         int chunk = out_dim / mv_n_threads;
         for (int t = 0; t < mv_n_threads; t++) {
             mv_work[t].kind = MV_KIND_I8;
