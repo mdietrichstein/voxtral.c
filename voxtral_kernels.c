@@ -38,14 +38,26 @@
 /* Minimum output rows to justify threading overhead */
 #define MATVEC_THREAD_THRESHOLD 512
 
+typedef enum {
+    MV_KIND_BF16 = 0,
+    MV_KIND_I8 = 1,
+} mv_kind_t;
+
 typedef struct {
+    mv_kind_t kind;
     float *y;
     const float *x;
-    const uint16_t *W_bf16;
     const float *bias;
     int in_dim;
     int out_start;
     int out_end;
+
+    /* bf16 */
+    const uint16_t *W_bf16;
+
+    /* int8 weight-only */
+    const int8_t *W_i8;
+    const float *scale;
 } matvec_work_t;
 
 static pthread_t        mv_threads[MATVEC_MAX_THREADS];
@@ -55,9 +67,12 @@ static pthread_barrier_t mv_done_barrier;
 static int              mv_n_threads = 0;
 static volatile int     mv_shutdown = 0;
 
-/* Forward declaration: the single-threaded bf16 matvec for a row range */
+/* Forward declarations: row-range matvec kernels */
 static void bf16_matvec_range(float *y, const float *x, const uint16_t *W_bf16,
                               const float *bias, int in_dim, int out_start, int out_end);
+static void i8_matvec_range(float *y, const float *x,
+                            const int8_t *W_i8, const float *scale,
+                            int in_dim, int out_start, int out_end);
 
 static void *mv_worker(void *arg) {
     int id = (int)(intptr_t)arg;
@@ -65,8 +80,13 @@ static void *mv_worker(void *arg) {
         pthread_barrier_wait(&mv_start_barrier);
         if (mv_shutdown) break;
         matvec_work_t *w = &mv_work[id];
-        bf16_matvec_range(w->y, w->x, w->W_bf16, w->bias,
-                          w->in_dim, w->out_start, w->out_end);
+        if (w->kind == MV_KIND_BF16) {
+            bf16_matvec_range(w->y, w->x, w->W_bf16, w->bias,
+                              w->in_dim, w->out_start, w->out_end);
+        } else {
+            i8_matvec_range(w->y, w->x, w->W_i8, w->scale,
+                            w->in_dim, w->out_start, w->out_end);
+        }
         pthread_barrier_wait(&mv_done_barrier);
     }
     return NULL;
@@ -302,6 +322,92 @@ static void bf16_matvec_range(float *y, const float *x, const uint16_t *W_bf16,
     }
 }
 
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+static void i8_matvec_range(float *y, const float *x,
+                            const int8_t *W_i8, const float *scale,
+                            int in_dim, int out_start, int out_end) {
+    for (int o = out_start; o < out_end; o++) {
+        const int8_t *w_row = W_i8 + (size_t)o * in_dim;
+        float sum = 0.0f;
+
+#if defined(__x86_64__) && defined(__AVX512F__)
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+        __m512 acc2 = _mm512_setzero_ps();
+        __m512 acc3 = _mm512_setzero_ps();
+
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            /* Load 64 int8 weights */
+            __m512i w8 = _mm512_loadu_si512((const void *)(w_row + k));
+
+            /* Widen to 16-bit (two halves of 32 i8) */
+            __m256i w8_lo = _mm512_castsi512_si256(w8);
+            __m256i w8_hi = _mm512_extracti64x4_epi64(w8, 1);
+            __m512i w16_lo = _mm512_cvtepi8_epi16(w8_lo);
+            __m512i w16_hi = _mm512_cvtepi8_epi16(w8_hi);
+
+            /* Convert to 32-bit and then to float (process 16 lanes at a time) */
+            __m512 x0 = _mm512_loadu_ps(x + k);
+            __m512 x1 = _mm512_loadu_ps(x + k + 16);
+            __m512 x2 = _mm512_loadu_ps(x + k + 32);
+            __m512 x3 = _mm512_loadu_ps(x + k + 48);
+
+            __m512i w32_0 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(w16_lo));
+            __m512i w32_1 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(w16_lo, 1));
+            __m512i w32_2 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(w16_hi));
+            __m512i w32_3 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(w16_hi, 1));
+
+            __m512 wf0 = _mm512_cvtepi32_ps(w32_0);
+            __m512 wf1 = _mm512_cvtepi32_ps(w32_1);
+            __m512 wf2 = _mm512_cvtepi32_ps(w32_2);
+            __m512 wf3 = _mm512_cvtepi32_ps(w32_3);
+
+            acc0 = _mm512_fmadd_ps(wf0, x0, acc0);
+            acc1 = _mm512_fmadd_ps(wf1, x1, acc1);
+            acc2 = _mm512_fmadd_ps(wf2, x2, acc2);
+            acc3 = _mm512_fmadd_ps(wf3, x3, acc3);
+        }
+
+        __m512 acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
+        sum += _mm512_reduce_add_ps(acc);
+
+        for (; k < in_dim; k++) sum += (float)w_row[k] * x[k];
+#else
+        for (int k = 0; k < in_dim; k++) sum += (float)w_row[k] * x[k];
+#endif
+
+        y[o] = sum * scale[o];
+    }
+}
+
+static void i8_matvec_fused(float *y, const float *x,
+                            const int8_t *W_i8, const float *scale,
+                            int in_dim, int out_dim) {
+#if defined(__linux__)
+    if (mv_n_threads > 0 && out_dim >= MATVEC_THREAD_THRESHOLD) {
+        int chunk = out_dim / mv_n_threads;
+        for (int t = 0; t < mv_n_threads; t++) {
+            mv_work[t].kind = MV_KIND_I8;
+            mv_work[t].y = y;
+            mv_work[t].x = x;
+            mv_work[t].W_i8 = W_i8;
+            mv_work[t].scale = scale;
+            mv_work[t].in_dim = in_dim;
+            mv_work[t].out_start = t * chunk;
+            mv_work[t].out_end = (t == mv_n_threads - 1) ? out_dim : (t + 1) * chunk;
+        }
+        pthread_barrier_wait(&mv_start_barrier);
+        pthread_barrier_wait(&mv_done_barrier);
+        return;
+    }
+#endif
+    i8_matvec_range(y, x, W_i8, scale, in_dim, 0, out_dim);
+}
+
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                               const float *bias, int in_dim, int out_dim) {
 #if defined(__linux__)
@@ -309,6 +415,7 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
     if (mv_n_threads > 0 && out_dim >= MATVEC_THREAD_THRESHOLD) {
         int chunk = out_dim / mv_n_threads;
         for (int t = 0; t < mv_n_threads; t++) {
+            mv_work[t].kind = MV_KIND_BF16;
             mv_work[t].y = y;
             mv_work[t].x = x;
             mv_work[t].W_bf16 = W_bf16;
@@ -332,12 +439,7 @@ void vox_linear_nobias_i8(float *y, const float *x,
      * Weight-only int8 (per-output scale), f32 accumulate.
      */
 
-    for (int o = 0; o < out_dim; o++) {
-        const int8_t *w_row = W_i8 + (size_t)o * in_dim;
-        float sum = 0.0f;
-        for (int k = 0; k < in_dim; k++) sum += (float)w_row[k] * x[k];
-        y[o] = sum * scale[o];
-    }
+    i8_matvec_fused(y, x, W_i8, scale, in_dim, out_dim);
 }
 
 void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
