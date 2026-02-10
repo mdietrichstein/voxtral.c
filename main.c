@@ -332,7 +332,7 @@ int main(int argc, char **argv) {
 
                 /* Process in 10ms windows for silence cancellation */
                 int off = 0;
-                while (off + MIC_WINDOW <= n && !enter_pressed && !mic_interrupted) {
+                while (off + MIC_WINDOW <= n) {
                     /* Compute RMS energy of this window */
                     float energy = 0;
                     for (int i = 0; i < MIC_WINDOW; i++) {
@@ -362,8 +362,6 @@ int main(int argc, char **argv) {
                     off += MIC_WINDOW;
                 }
 
-                if (enter_pressed || mic_interrupted) break;
-
                 /* Feed any remaining samples (< 1 window) */
                 if (off < n)
                     vox_stream_feed(s, mic_buf + off, n - off);
@@ -376,9 +374,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* Stop mic immediately — discard any unprocessed raw audio
-             * still sitting in the mic ring buffer. Only transcribe what
-             * has already been fed to the stream. */
+            /* Stop mic capture (no more new audio arrives) */
             vox_mic_stop();
 
             if (mic_interrupted) {
@@ -389,6 +385,14 @@ int main(int argc, char **argv) {
 
             if (vox_verbose >= 1)
                 fprintf(stderr, "\nProcessing remaining audio...\n");
+
+            /* Feed any audio still in the mic ring buffer — this was
+             * captured but not yet read when ENTER was pressed. */
+            {
+                int n;
+                while ((n = vox_mic_read(mic_buf, 4800)) > 0)
+                    vox_stream_feed(s, mic_buf, n);
+            }
 
             /* Finish the stream — this adds final padding, runs
              * encoder+decoder one last time, and produces all remaining
