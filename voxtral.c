@@ -1021,8 +1021,8 @@ int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
 void vox_stream_free(vox_stream_t *s) {
     if (!s) return;
 
-    /* Print stats after caller has drained all tokens */
-    if (vox_verbose >= 1) {
+    /* Print stats after caller has drained all tokens (skip if no real audio fed) */
+    if (vox_verbose >= 1 && s->real_samples_fed > 0) {
         fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
                 s->mel_cursor, s->total_adapter, s->encoder_ms);
         if (s->n_text_tokens > 0) {
