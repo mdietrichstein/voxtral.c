@@ -294,7 +294,12 @@ int main(int argc, char **argv) {
             if (off < n)
                 vox_stream_feed(s, mic_buf + off, n - off);
 
-            drain_tokens(s);
+            /* If we are falling behind, prioritize feeding audio and postpone
+             * token draining/printing until backlog is reduced.
+             */
+            if (vox_mic_read_available() < 80000) { /* < ~5 seconds */
+                drain_tokens(s);
+            }
         }
 
         vox_mic_stop();
