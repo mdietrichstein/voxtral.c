@@ -237,18 +237,18 @@ int main(int argc, char **argv) {
         while (!mic_interrupted) {
             /* Over-buffer detection */
             int avail = vox_mic_read_available();
-            if (avail > 80000) { /* > 5 seconds buffered */
+            if (avail > 320000) { /* > 20 seconds buffered */
                 if (!overbuf_warned) {
                     fprintf(stderr, "Warning: can't keep up, skipping audio\n");
                     overbuf_warned = 1;
                 }
-                /* Drain all but last ~1 second */
+                /* Drain all but last ~5 seconds */
                 float discard[4800];
-                while (vox_mic_read_available() > 16000)
+                while (vox_mic_read_available() > 80000)
                     vox_mic_read(discard, 4800);
                 silence_count = 0;
                 was_skipping = 0;
-            } else if (avail < 32000) { /* < 2 seconds: clear warning */
+            } else if (avail < 160000) { /* < 10 seconds: clear warning */
                 overbuf_warned = 0;
             }
 

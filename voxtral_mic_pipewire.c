@@ -24,7 +24,7 @@
 #include <string.h>
 
 #define MIC_SAMPLE_RATE   16000
-#define RING_CAPACITY     160000 /* 10 seconds */
+#define RING_CAPACITY     960000 /* 60 seconds at 16kHz */
 
 static struct pw_main_loop *g_loop;
 static struct pw_context   *g_ctx;
