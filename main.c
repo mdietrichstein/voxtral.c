@@ -18,12 +18,52 @@
 #include <unistd.h>
 #include <math.h>
 #include <sys/time.h>
+#include <pthread.h>
+#include <termios.h>
+#include <poll.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
 /* SIGINT handler for clean exit from --from-mic */
 static volatile sig_atomic_t mic_interrupted = 0;
 static void sigint_handler(int sig) { (void)sig; mic_interrupted = 1; }
+
+/* Background thread state for ENTER detection in mic mode.
+ * The thread uses poll() on stdin + a shutdown pipe so it never
+ * gets stuck in a blocking read that can't be interrupted. */
+static volatile sig_atomic_t enter_pressed = 0;
+static int input_pipe[2] = {-1, -1}; /* [0]=read, [1]=write; write to wake thread */
+
+static void *input_thread_func(void *arg) {
+    (void)arg;
+    /* Block all signals so poll/read are never interrupted by EINTR.
+     * Signals (e.g. SIGINT) will be delivered to the main thread. */
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);
+
+    struct pollfd fds[2];
+    fds[0].fd = STDIN_FILENO;
+    fds[0].events = POLLIN;
+    fds[1].fd = input_pipe[0]; /* shutdown pipe read end */
+    fds[1].events = POLLIN;
+
+    while (1) {
+        int ret = poll(fds, 2, -1); /* block until stdin or pipe ready */
+        if (ret <= 0) continue;     /* EINTR or error, retry */
+
+        if (fds[1].revents & POLLIN)
+            break; /* shutdown requested */
+
+        if (fds[0].revents & POLLIN) {
+            char ch;
+            ssize_t r = read(STDIN_FILENO, &ch, 1);
+            if (r == 1 && (ch == '\n' || ch == '\r'))
+                enter_pressed = 1;
+        }
+    }
+    return NULL;
+}
 
 static void usage(const char *prog) {
     fprintf(stderr, "voxtral.c — Voxtral Realtime 4B speech-to-text\n\n");
@@ -32,7 +72,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -d <dir>      Model directory (with consolidated.safetensors, tekken.json)\n");
     fprintf(stderr, "  -i <file>     Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
-    fprintf(stderr, "  --from-mic    Capture from default microphone (macOS only, Ctrl+C to stop)\n");
+    fprintf(stderr, "  --from-mic    Capture from microphone (ENTER to start/stop, Ctrl+C to quit)\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -I <secs>     Encoder processing interval in seconds (default: 2.0)\n");
     fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
@@ -208,103 +248,184 @@ int main(int argc, char **argv) {
     }
 
     if (use_mic) {
-        /* Microphone capture with silence cancellation */
-        if (vox_mic_start() != 0) {
-            vox_stream_free(s);
-            vox_free(ctx);
-            return 1;
-        }
+        /* Put terminal in raw mode: disable canonical buffering and echo,
+         * but keep ISIG so that Ctrl+C still delivers SIGINT. */
+        struct termios orig_term, raw_term;
+        tcgetattr(STDIN_FILENO, &orig_term);
+        raw_term = orig_term;
+        raw_term.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+        raw_term.c_cc[VMIN] = 1;  /* blocking read (1 byte minimum) */
+        raw_term.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw_term);
 
-        /* Install SIGINT handler for clean Ctrl+C exit */
+        /* Install SIGINT handler — Ctrl+C still works because ISIG is set */
         struct sigaction sa;
         sa.sa_handler = sigint_handler;
         sa.sa_flags = 0;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGINT, &sa, NULL);
 
+        /* Start background thread that polls stdin for ENTER.
+         * Uses a pipe for clean shutdown (write to pipe wakes poll). */
+        enter_pressed = 0;
+        pipe(input_pipe);
+        pthread_t input_tid;
+        pthread_create(&input_tid, NULL, input_thread_func, NULL);
+
         if (vox_verbose >= 1)
-            fprintf(stderr, "Listening (Ctrl+C to stop)...\n");
+            fprintf(stderr, "Press ENTER to start recording (Ctrl+C to quit)...\n");
+
+        /* Wait for ENTER to start, or Ctrl+C to quit */
+        while (!mic_interrupted && !enter_pressed)
+            usleep(50000);
 
         /* Silence cancellation state */
         #define MIC_WINDOW 160          /* 10ms at 16kHz */
         #define SILENCE_THRESH 0.002f   /* RMS threshold (~-54 dBFS) */
         #define SILENCE_PASS 60         /* pass-through windows (600ms) */
-        float mic_buf[4800]; /* 300ms max read */
-        int silence_count = 0;
-        int was_skipping = 0; /* were we skipping silence? */
-        int overbuf_warned = 0;
 
         while (!mic_interrupted) {
-            /* Over-buffer detection */
-            int avail = vox_mic_read_available();
-            if (avail > 320000) { /* > 20 seconds buffered */
-                if (!overbuf_warned) {
-                    fprintf(stderr, "Warning: can't keep up, skipping audio\n");
-                    overbuf_warned = 1;
-                }
-                /* Drain all but last ~5 seconds */
-                float discard[4800];
-                while (vox_mic_read_available() > 80000)
-                    vox_mic_read(discard, 4800);
-                silence_count = 0;
-                was_skipping = 0;
-            } else if (avail < 160000) { /* < 10 seconds: clear warning */
-                overbuf_warned = 0;
+            /* Start recording */
+            if (vox_mic_start() != 0) {
+                write(input_pipe[1], "q", 1);
+                pthread_join(input_tid, NULL);
+                close(input_pipe[0]); close(input_pipe[1]);
+                tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
+                vox_stream_free(s);
+                vox_free(ctx);
+                return 1;
             }
 
-            int n = vox_mic_read(mic_buf, 4800);
-            if (n == 0) {
-                usleep(10000); /* 10ms idle sleep */
-                continue;
-            }
+            enter_pressed = 0; /* clear for this recording session */
 
-            /* Process in 10ms windows for silence cancellation */
-            int off = 0;
-            while (off + MIC_WINDOW <= n) {
-                /* Compute RMS energy of this window */
-                float energy = 0;
-                for (int i = 0; i < MIC_WINDOW; i++) {
-                    float v = mic_buf[off + i];
-                    energy += v * v;
-                }
-                float rms = sqrtf(energy / MIC_WINDOW);
+            if (vox_verbose >= 1)
+                fprintf(stderr, "Recording... (press ENTER to stop, Ctrl+C to quit)\n");
 
-                if (rms > SILENCE_THRESH) {
-                    /* Voice detected */
-                    if (was_skipping)
-                        was_skipping = 0;
-                    vox_stream_feed(s, mic_buf + off, MIC_WINDOW);
-                    silence_count = 0;
-                } else {
-                    /* Silence detected */
-                    silence_count++;
-                    if (silence_count <= SILENCE_PASS) {
-                        /* Short silence: pass through (natural word gap) */
-                        vox_stream_feed(s, mic_buf + off, MIC_WINDOW);
-                    } else if (!was_skipping) {
-                        /* Entering silence: flush buffered audio */
-                        was_skipping = 1;
-                        vox_stream_flush(s);
+            float mic_buf[4800]; /* 300ms max read */
+            int silence_count = 0;
+            int was_skipping = 0;
+            int overbuf_warned = 0;
+
+            while (!enter_pressed && !mic_interrupted) {
+                /* Over-buffer detection */
+                int avail = vox_mic_read_available();
+                if (avail > 320000) { /* > 20 seconds buffered */
+                    if (!overbuf_warned) {
+                        fprintf(stderr, "Warning: can't keep up, skipping audio\n");
+                        overbuf_warned = 1;
                     }
+                    /* Drain all but last ~5 seconds */
+                    float discard[4800];
+                    while (vox_mic_read_available() > 80000)
+                        vox_mic_read(discard, 4800);
+                    silence_count = 0;
+                    was_skipping = 0;
+                } else if (avail < 160000) { /* < 10 seconds: clear warning */
+                    overbuf_warned = 0;
                 }
-                off += MIC_WINDOW;
+
+                int n = vox_mic_read(mic_buf, 4800);
+                if (n == 0) {
+                    usleep(10000); /* 10ms idle sleep */
+                    continue;
+                }
+
+                /* Process in 10ms windows for silence cancellation */
+                int off = 0;
+                while (off + MIC_WINDOW <= n && !enter_pressed && !mic_interrupted) {
+                    /* Compute RMS energy of this window */
+                    float energy = 0;
+                    for (int i = 0; i < MIC_WINDOW; i++) {
+                        float v = mic_buf[off + i];
+                        energy += v * v;
+                    }
+                    float rms = sqrtf(energy / MIC_WINDOW);
+
+                    if (rms > SILENCE_THRESH) {
+                        /* Voice detected */
+                        if (was_skipping)
+                            was_skipping = 0;
+                        vox_stream_feed(s, mic_buf + off, MIC_WINDOW);
+                        silence_count = 0;
+                    } else {
+                        /* Silence detected */
+                        silence_count++;
+                        if (silence_count <= SILENCE_PASS) {
+                            /* Short silence: pass through (natural word gap) */
+                            vox_stream_feed(s, mic_buf + off, MIC_WINDOW);
+                        } else if (!was_skipping) {
+                            /* Entering silence: flush buffered audio */
+                            was_skipping = 1;
+                            vox_stream_flush(s);
+                        }
+                    }
+                    off += MIC_WINDOW;
+                }
+
+                if (enter_pressed || mic_interrupted) break;
+
+                /* Feed any remaining samples (< 1 window) */
+                if (off < n)
+                    vox_stream_feed(s, mic_buf + off, n - off);
+
+                /* If we are falling behind, prioritize feeding audio and postpone
+                 * token draining/printing until backlog is reduced.
+                 */
+                if (vox_mic_read_available() < 80000) { /* < ~5 seconds */
+                    drain_tokens(s);
+                }
             }
 
-            /* Feed any remaining samples (< 1 window) */
-            if (off < n)
-                vox_stream_feed(s, mic_buf + off, n - off);
+            /* Stop mic immediately — discard any unprocessed raw audio
+             * still sitting in the mic ring buffer. Only transcribe what
+             * has already been fed to the stream. */
+            vox_mic_stop();
 
-            /* If we are falling behind, prioritize feeding audio and postpone
-             * token draining/printing until backlog is reduced.
-             */
-            if (vox_mic_read_available() < 80000) { /* < ~5 seconds */
-                drain_tokens(s);
+            if (mic_interrupted) {
+                if (vox_verbose >= 1)
+                    fprintf(stderr, "\nStopping...\n");
+                break;
             }
+
+            if (vox_verbose >= 1)
+                fprintf(stderr, "\nProcessing remaining audio...\n");
+
+            /* Finish the stream — this adds final padding, runs
+             * encoder+decoder one last time, and produces all remaining
+             * tokens. We need a fresh stream for the next recording. */
+            vox_stream_finish(s);
+            drain_tokens(s);
+            fputs("\n", stdout);
+            fflush(stdout);
+
+            /* Free old stream and create a fresh one for next recording */
+            vox_stream_free(s);
+            s = vox_stream_init(ctx);
+            if (!s) {
+                fprintf(stderr, "Failed to reinit stream\n");
+                break;
+            }
+            if (alt_cutoff >= 0)
+                vox_stream_set_alt(s, 3, alt_cutoff);
+            if (interval > 0) {
+                vox_set_processing_interval(s, interval);
+            }
+            first_token = 1;
+
+            if (vox_verbose >= 1)
+                fprintf(stderr, "Recording stopped. Press ENTER to record again (Ctrl+C to quit)...\n");
+
+            /* Wait for ENTER to start again, or Ctrl+C to quit */
+            enter_pressed = 0;
+            while (!mic_interrupted && !enter_pressed)
+                usleep(50000);
         }
 
-        vox_mic_stop();
-        if (vox_verbose >= 1)
-            fprintf(stderr, "\nStopping...\n");
+        /* Shut down input thread and restore terminal */
+        write(input_pipe[1], "q", 1); /* wake poll() so thread exits */
+        pthread_join(input_tid, NULL);
+        close(input_pipe[0]); close(input_pipe[1]);
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
     } else if (use_stdin) {
         /* Peek at first 4 bytes to detect WAV vs raw */
         uint8_t hdr[4];

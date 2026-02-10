@@ -22,7 +22,7 @@ make test
 ./voxtral -d voxtral-model -i audio.wav --debug     # per-layer/per-chunk details
 ./voxtral -d voxtral-model -i audio.wav --alt 0.5   # show alternative tokens inline
 
-# Microphone input (macOS only, Ctrl+C to stop)
+# Microphone input (ENTER to start/stop recording, Ctrl+C to quit)
 ./voxtral -d voxtral-model --from-mic               # default: 2s processing interval
 ./voxtral -d voxtral-model --from-mic -I 1.0         # 1s interval for lower latency
 
