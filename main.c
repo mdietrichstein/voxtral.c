@@ -518,8 +518,10 @@ int main(int argc, char **argv) {
         free(samples);
     }
 
-    vox_stream_finish(s);
-    drain_tokens(s);
+    if (!use_mic) {
+        vox_stream_finish(s);
+        drain_tokens(s);
+    }
     fputs("\n", stdout);
     fflush(stdout);
 
