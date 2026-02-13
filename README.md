@@ -8,6 +8,16 @@ Audio processing uses a chunked encoder with overlapping windows, bounding memor
 
 ![demo](samples/demo.gif)
 
+## Fork Changes
+
+This fork extends [antirez's original implementation](https://github.com/antirez/voxtral.c) with Linux GPU acceleration, Linux microphone support, and CPU-side optimizations. All changes are listed below.
+
+**Vulkan compute backend.** A full Vulkan GPU backend (`voxtral_vulkan.c`, ~2200 lines) was added alongside 16 GLSL compute shaders covering matmul (BF16 and F32), attention (encoder and decoder), RoPE, RMS norm, activation functions, and KV cache management. Build with `make vulkan` on Linux. The backend includes a fence-based command ring to avoid `vkQueueWaitIdle` stalls, per-slot descriptor pools that reset on fence completion to eliminate descriptor-set free churn, persistently mapped weight buffers, and tunable encoder layer batching (`VOX_VK_LAYERS_PER_SUBMIT`). Optional profiling is available via `VOX_VK_TIMING=1` (CPU submit timing) and `VOX_VK_GPU_TIMING=1` (GPU timestamp queries). This was originally developed for AMD integrated GPUs but should work on any Vulkan-capable device.
+
+**Linux microphone capture via PipeWire.** The `--from-mic` flag now works on Linux in addition to macOS. The Linux backend (`voxtral_mic_pipewire.c`) captures from the default PipeWire audio source at 16 kHz, converts to float, and pushes samples into a lock-protected ring buffer. The microphone UI was also reworked across both platforms: press ENTER to start recording, ENTER again to stop, and Ctrl+C to quit. Each recording session gets a fresh stream, and the ring buffer is fully drained before finishing.
+
+**CPU-side optimizations for Linux/x86-64.** On the BLAS path, the decoder now supports optional int8 weight-only quantization for both FFN and attention projections (enabled via `VOX_DEC_FFN_INT8=1` and `VOX_DEC_ATTN_INT8=1`). Weights are quantized at load time with per-output-channel scaling, and the int8 matvec inner loop uses explicit AVX-512 intrinsics for throughput. A barrier-based thread pool distributes rows across cores for large matmuls. Additionally, OpenBLAS `sbgemm` (native BF16 GEMM) is used for encoder/decoder prefill when available, avoiding the BF16→F32 weight conversion that made the original BLAS path slow. A `--bench-decode` flag was added for isolated decoder forward-pass microbenchmarking.
+
 ## Motivations (and some rant)
 
 **Thank you to Mistral** for releasing such a great model in an Open Weights fashion. However, the author of this project believes that limiting the inference to a partnership with vLLM, without providing a self-contained reference implementation in Python, limits the model's actual reach and the potential good effects it could have. For this reason, this project was created: it provides both a pure C inference engine and a simple, self-contained Python reference implementation (`python_simple_implementation.py`) that anyone can read and understand without digging through the vLLM codebase.
